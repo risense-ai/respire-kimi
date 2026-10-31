@@ -523,7 +523,9 @@ def on_prompt(data: dict, cfg: dict, engine) -> str:
             log_event(cfg, "prompt", "internal_skip", pat)
             return nudge
     if contains_secret(prompt):
-        log_event(cfg, "prompt", "secret_skip", prompt[:40])
+        # 只记固定原因码，不落命中摘要：摘要可能含凭据明文，而 redact 不覆盖
+        # api_key/token/secret 普通赋值与 Bearer 值，落摘要即泄漏。
+        log_event(cfg, "prompt", "secret_skip")
         return nudge + "\n" + SECRET_SKIP if nudge else SECRET_SKIP
     m = SLASH_PREFIX.match(prompt)                 # 剥斜杠命令 token（/skill:…、/respire:…），防污染召回 query
     if m:

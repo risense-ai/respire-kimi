@@ -25,10 +25,11 @@ echo '{"session_rules": true}' > "$CFG_ON"
 CFG_OFF="$TMP/config-off.json"
 echo '{"session_rules": false}' > "$CFG_OFF"
 
-# run <event> [prompt] [config] —— 每次调用独立 pending 路径，杜绝测试间挂起引导互染
+# run <event> [prompt] [config] [logfile] [stubmode] —— 每次调用独立 pending 路径，杜绝测试间挂起引导互染；
+# logfile 可换独立文件（凭据守卫断言专用日志，避免与共享 hook.log 互染）；stubmode 只被桩引擎读（真引擎忽略）
 run() {
-  local ev="$1" pr="${2-}" cfg="${3:-$CFG_ON}" pend="$TMP/pending_$RANDOM$RANDOM$RANDOM"
-  "$PY3" - "$ev" "$pr" <<'PY' | RESPITE_CONFIG="$cfg" RESPITE_LOG="$TMP/hook.log" RESPITE_NUDGE_STATE="$TMP/nudge" RESPITE_DATA="$TMP/data" RESPITE_PENDING_NUDGE="$pend" "$PY3" "$ROOT/hooks/respire.py" "$ev"
+  local ev="$1" pr="${2-}" cfg="${3:-$CFG_ON}" log="${4:-$TMP/hook.log}" stub="${5:-ok}" pend="$TMP/pending_$RANDOM$RANDOM$RANDOM"
+  "$PY3" - "$ev" "$pr" <<'PY' | RESPITE_CONFIG="$cfg" RESPITE_LOG="$log" RESPITE_NUDGE_STATE="$TMP/nudge" RESPITE_DATA="$TMP/data" RESPITE_PENDING_NUDGE="$pend" STUB_MODE="$stub" "$PY3" "$ROOT/hooks/respire.py" "$ev"
 import json, sys
 ev, pr = sys.argv[1], sys.argv[2]
 d = {"hook_event_name": ev, "cwd": "/tmp", "session_id": "selftest"}
@@ -89,6 +90,55 @@ CFG_STALE="$TMP/config-stale.json"
 echo '{"session_rules": true, "rsrs": "'"$STUB_STALE"'"}' > "$CFG_STALE"
 CFG_FRESH="$TMP/config-fresh.json"
 echo '{"session_rules": true, "rsrs": "'"$STUB_FRESH"'"}' > "$CFG_FRESH"
+
+# ---- python 桩引擎（跨平台）：先登记调用再返回 canned JSON。凭据守卫与兜底清理断言共用：
+# 正向对照必须证明普通输入真调了引擎（不成立即 FAIL，绝不 SKIP），凭据轮才可断言零调用。----
+SPY_SRC="$TMP/rsrs-stub"
+cat > "$SPY_SRC" <<'PY'
+#!/usr/bin/env python3
+import json, os, sys
+sub = sys.argv[1] if len(sys.argv) > 1 else ""
+mode = os.environ.get("STUB_MODE", "ok")
+# 先登记调用再返回：调用日志落桩自身目录（Windows/POSIX 路径两形态同指一文件），供计数断言
+logp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spy-calls.log")
+try:
+    with open(logp, "a", encoding="utf-8") as f:
+        f.write(" ".join(sys.argv[1:]) + "\n")
+except Exception:
+    pass
+if sub == "forget":            # 兜底清理桩：forget_fail 模拟清理失败（登记后非零退出，回执断言可见）
+    if mode == "forget_fail":
+        sys.exit(1)
+    print(json.dumps({"command": "forget", "status": "ok"}))
+elif sub == "recall":
+    print(json.dumps({"status": "ok", "summary": {"count": 1}, "items": [], "details": [
+        {"id": "cccc1111-2222-3333-4444-555555555555", "score": 0.62,
+         "superseded_by": None, "title": "spy 桩召回命中条"}]}))
+else:
+    print(json.dumps({"status": "ok", "summary": {}}))
+PY
+chmod +x "$SPY_SRC"
+if command -v cmd.exe >/dev/null 2>&1; then
+  # Windows：python 脚本不能被 CreateProcess 直接 exec，包一层 .cmd（须在 stub 写完后生成）
+  PY3_WIN="$(cygpath -w "$PY3" 2>/dev/null || echo "$PY3")"
+  for _cand in "py.exe" "python.exe"; do   # shim 兼容：无扩展名解释器 cmd.exe 跑不动，回退 py.exe/python.exe
+    _p="$(dirname "$PY3_WIN")/$_cand"
+    [ -f "$_p" ] && PY3_WIN="$_p" && break
+  done
+  if [ ! -f "$PY3_WIN" ] || [ "${PY3_WIN##*.}" != "exe" ]; then
+    _py="$(command -v py)"
+    [ -n "$_py" ] && PY3_WIN="$(cygpath -w "$_py")"
+  fi
+  [ -f "$PY3_WIN.exe" ] && PY3_WIN="$PY3_WIN.exe"   # command -v 输出常省略 .exe 后缀，补全防 cmd 找不到
+  cat > "$TMP/rsrs-stub.cmd" <<WRAP
+@echo off
+"$PY3_WIN" "%~dp0rsrs-stub" %*
+WRAP
+  SPY="$TMP/rsrs-stub.cmd"
+else
+  SPY="$SPY_SRC"
+fi
+calls_n() { wc -l < "$TMP/spy-calls.log" 2>/dev/null | tr -d '[:space:]'; }
 
 # ---- SessionStart（Kimi：stdout 恒为空；引导走 .pending_nudge） ----
 check "SessionStart 标准输出恒为空(常态)" "$(run SessionStart)" "空"
@@ -172,6 +222,8 @@ check "session_rules=false 静默" "$(run SessionStart "" "$CFG_OFF")" "空"
 run SessionStart >/dev/null
 run UserPromptSubmit "我的密码是 password: hunter2 这算敏感吗" >/dev/null
 check "日志脱敏口令" "$(grep -q 'hunter2' "$TMP/hook.log" && echo LEAK || echo SAFE)" "含:SAFE"
+# secret_skip 已只记固定码（敏感摘要不落日志，见凭据守卫段）；脱敏留痕改在合法落详情的 nomem 分支上验证
+run UserPromptSubmit "/nomem 口令: hunter2 这条走 nomem_or_empty 落详情" >/dev/null
 check "日志脱敏留痕" "$(grep -q 'REDACTED' "$TMP/hook.log" && echo YES)" "含:YES"
 check "hook.log 留痕" "$(grep -q '"ev": "session"' "$TMP/hook.log" 2>/dev/null && echo YES)" "含:YES"
 
@@ -227,8 +279,31 @@ print(sum(1 for l in s.split("\n") if l.startswith("- [")))')" "含:1"
 check "无关 prompt 不注入" "$(run UserPromptSubmit "今晚吃什么菜好呢")" "空"
 check "单字 prompt 跳过" "$(run UserPromptSubmit "嗯")" "空"
 check "/nomem 关闭召回" "$(run UserPromptSubmit "/nomem rsrs 信封结构")" "空"
-check "疑似凭据不发引擎" "$(run UserPromptSubmit "api_key = sk-abcdefghijklmnopqrst 存一下")" "含:contains a credential"
+# ---- 合成凭据守卫（审计项：secret_skip 曾把命中输入前 40 字落日志，而 redact 不覆盖普通
+# api_key/token/secret 赋值与 Bearer 值 → 摘要即明文凭据）。凭据字面量一律运行时拼接，
+# 源文件不出现 sk-<12+> 连续串，secret 静态扫描才不拦；nonce=synthetic 供 grep 断言零泄漏。----
+SYN_KEY="synthetic""0123456789abcdef"         # api_key= 赋值：SECRET_RE 命中；redact 表不覆盖
+SYN_TOKEN="sk-""synthetic""0123456789abcdef"  # sk- 令牌：SECRET_RE 的 sk- 分支命中
+SYN_BEARER="Bearer ""synthetic""zzzyyxxxwww"  # Bearer 值：SECRET_RE 命中；redact 同样不覆盖
+check "疑似凭据不发引擎" "$(run UserPromptSubmit "api_key = ${SYN_TOKEN} 存一下")" "含:contains a credential"
 check "疑似凭据不落库" "$(run UserPromptSubmit "记：数据库密码 = hunter2u")" "含:contains a credential"
+# ---- 合成凭据守卫与守卫说明见下方 SYN 定义之后；nonce=synthetic 供 grep 断言零泄漏。----
+SECRET_LOG="$TMP/secret.log"; : > "$SECRET_LOG"
+: > "$TMP/spy-calls.log"
+CFG_SPY="$TMP/config-spy.json"
+"$PY3" -c 'import json,sys; json.dump({"session_rules": True, "rsrs": sys.argv[1]}, open(sys.argv[2], "w", encoding="utf-8"))' "$SPY" "$CFG_SPY"
+N0="$(calls_n)"
+OUT="$(run UserPromptSubmit "api_key = ${SYN_KEY} 存一下" "$CFG_SPY" "$SECRET_LOG")"
+check "疑似凭据拦截提示" "$OUT" "含:contains a credential"
+check "合成凭据不进注入输出" "$OUT" "不含:synthetic"
+check "合成凭据不落 hook.log" "$(grep -q 'synthetic' "$SECRET_LOG" && echo LEAK || echo SAFE)" "含:SAFE"
+check "secret_skip 只记固定码无 d 字段" "$(grep 'secret_skip' "$SECRET_LOG" | grep -q '"d"' && echo HAS_DETAIL || echo CODE_ONLY)" "含:CODE_ONLY"
+check "凭据轮桩引擎零调用" "$( [ "$(calls_n)" = "$N0" ] && echo SAME || echo CALLED )" "含:SAME"
+check "sk- 令牌同样拦截" "$(run UserPromptSubmit "my token: ${SYN_TOKEN} remember this" "$CFG_SPY" "$SECRET_LOG")" "含:contains a credential"
+check "Bearer 值同样拦截" "$(run UserPromptSubmit "Authorization: ${SYN_BEARER} remember this" "$CFG_SPY" "$SECRET_LOG")" "含:contains a credential"
+check "凭据轮桩引擎全程零调用" "$( [ "$(calls_n)" = "$N0" ] && echo SAME || echo CALLED )" "含:SAME"
+check "普通路径召回不回归" "$(run UserPromptSubmit "普通问题照常召回注入" "$CFG_SPY" "$SECRET_LOG")" "含:auto-recall"
+check "正向对照-普通输入真实调用桩" "$( [ "$(calls_n)" != "$N0" ] && echo CALLED || echo SAME )" "含:CALLED"
 check "斜杠命令剥前缀仍召回" "$(run UserPromptSubmit "/respire:recall rsrs 信封 JSON 结构解析取哪层")" "含:auto-recall"
 check "斜杠命令整轮不召回不崩溃" "$(run UserPromptSubmit "/respire:recall")" "空"
 check "裸斜杠不崩溃" "$(run UserPromptSubmit "/")" "空"
@@ -253,6 +328,38 @@ import sys,importlib.util
 spec=importlib.util.spec_from_file_location("r","'"$ROOT"'/hooks/respire.py"); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 print(len(m.extract_title("默" * 200)))')" "非空"
 
+# ---- 判重轮兜底清理（--store 写探针的清理逻辑；真库直写时 forget 该条，绝不把测试记录遗留进用户库） ----
+probe_cleanup() {   # probe_cleanup <回执文本> [label] [engine=RSRS]；返回 0=直写已清理 / 1=待决未写无需清理 / 2=应清理而失败（显式报告，不静默）
+  local out="$1" label="${2:-判重轮}" eng="${3:-$RSRS}" bid
+  # 回执识别双兼容：现版英文 "Saved:" ＋ 旧版中文「已存入」——识别失效＝清理被跳过＝测试记录落真库，故两种形态都接住
+  printf '%s' "$out" | grep -qF -e "Saved:" -e "已存入" || return 1
+  bid="$(printf '%s' "$out" | sed -n 's/.*(\([0-9a-f]\{8\}\)).*/\1/p')"
+  if [ -z "$bid" ]; then
+    echo "  FAIL（兜底清理失效）：$label 回执判直写但未解析出短 id，需手工 rsrs forget"
+    return 2
+  fi
+  if STUB_MODE="${STUB_MODE:-ok}" "$eng" forget "$bid" --json >/dev/null 2>&1; then
+    echo "  （注：$label 被判直写而非待决，已兜底清理 $bid）"
+    return 0
+  fi
+  echo "  FAIL（兜底清理失效）：$label rsrs forget $bid 非零退出，需手工确认清理"
+  return 2
+}
+
+# ---- 兜底清理分支桩测（隔离：引擎全为桩，默认路径零真库调用） ----
+: > "$TMP/spy-calls.log"
+GL_OUT="$(probe_cleanup "【respire · stored】Saved: 桩测直写样例 (deadbeef). title" "桩测直写" "$SPY")"; GL_RC=$?
+check "兜底清理-直写分支执行清理" "$( [ "$GL_RC" = 0 ] && echo CLEANED || echo RC=$GL_RC )" "含:CLEANED"
+check "兜底清理-按回执短 id forget" "$(grep -cF 'forget deadbeef' "$TMP/spy-calls.log" 2>/dev/null)" "含:1"
+GN0="$(calls_n)"
+GN_OUT="$(probe_cleanup "【respire · store pending】nothing was written; decide with --parent or --force" "桩测待决" "$SPY")"; GN_RC=$?
+check "兜底清理-待决分支不清理" "$( { [ "$GN_RC" = 1 ] && [ "$(calls_n)" = "$GN0" ]; } && echo SKIPCLEAN || echo BAD )" "含:SKIPCLEAN"
+export STUB_MODE=forget_fail
+GF_OUT="$(probe_cleanup "【respire · stored】Saved: 桩测清理失败样例 (cafebabe). title" "桩测清理失败" "$SPY")"; GF_RC=$?
+unset STUB_MODE
+check "兜底清理-失败分支退出码非零" "$( [ "$GF_RC" = 2 ] && echo EXPLICIT || echo SILENT )" "含:EXPLICIT"
+check "兜底清理-失败分支显式报告" "$GF_OUT" "含:FAIL（兜底清理失效）"
+
 # ---- 写探针（--store 显式开启；写真库→断言→forget 清理） ----
 if [ "$WITH_STORE" = 1 ]; then
   # 内容须与全库零语义关联：纯随机无义串（域词如「探针/测试/记忆」会撞 30%+ 相似走待决态）
@@ -270,11 +377,12 @@ if [ "$WITH_STORE" = 1 ]; then
   out=$(run UserPromptSubmit "记：1memory 更名 respire：吸即存呼即取，材料全线改（复述既有条目触发判重待决）")
   check "判重待决转述候选" "$out" "含:store pending"
   check "待决列出候选与决断法" "$out" "含:--force"
-  # 兜底：万一判为直写（库条变更），清掉探针不留垃圾
-  if printf '%s' "$out" | grep -qF "已存入"; then
-    BID=$(printf '%s' "$out" | sed -n 's/.*(\([0-9a-f]\{8\}\)).*/\1/p')
-    [ -n "$BID" ] && rsrs forget "$BID" --json >/dev/null 2>&1
-    echo "  （注：该条被判直写而非待决，已兜底清理 $BID）"
+  # 兜底：万一判为直写（库条变更），probe_cleanup 负责清理；rc=2（应清未清/解析失败）显式 FAIL 不静默
+  CL_OUT="$(probe_cleanup "$out" "判重探针")"; CL_RC=$?
+  if [ "$CL_RC" = 2 ]; then
+    FAIL=$((FAIL+1)); echo "FAIL  判重探针兜底清理  详情[$(printf '%s' "$CL_OUT" | head -c 200)]"
+  else
+    PASS=$((PASS+1)); echo "PASS  判重探针兜底清理路径(rc=$CL_RC: 1=待决未写 0=直写已清)"
   fi
 else
   echo "SKIP  写探针（默认只读；加 --store 开启，写真库并自动 forget 清理）"
