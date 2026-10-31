@@ -1,10 +1,10 @@
 ---
-description: 翻忆：按「项目名+关键词」查 respire 记忆库（标题档），选中后读全文
+description: Recall: search the respire memory store by "project name + keywords" (title tier), then read selected full texts
 ---
 
-请执行 respire 记忆翻忆（rsrs CLI，只读）：
+Perform a respire memory recall (rsrs CLI, read-only):
 
-1. 若已给参数：运行 `rsrs recall "$ARGUMENTS" --titles --json`；**查询词必须含项目名**。若未给参数：先问用户要查什么（项目名+核心词）。
-2. 结果为标题档（分数＋8 位短 id＋标题）。凭标题挑出贴题条目，逐条 `rsrs show <短id> --json` 读全文；标 `superseded_by` 的先看取代它的新条。
-3. 零命中或命中不贴题：换 2–3 组词重查（同义词、上位词、英文对应词各一路），再下「无记忆」结论。
-4. 把命中要点简要转述给用户，注明短 id 备查。
+1. If arguments are given: run `rsrs recall "$ARGUMENTS" --titles --json`; **the query must contain the project name**. If no arguments: first ask the user what to look up (project name + core keywords).
+2. Results are title tier (score + 8-char short id + title). Pick on-topic entries by title and read each full body with `rsrs show <short-id> --json`; for entries marked `superseded_by`, read the replacing record first.
+3. Zero hits or off-topic hits: re-query with 2–3 different wordings (synonyms, hypernyms, English equivalents, one route each) before concluding "no memory".
+4. Briefly relay the key points of the hits to the user, noting the short ids for reference.
