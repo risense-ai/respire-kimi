@@ -356,7 +356,8 @@ probe_cleanup() {   # probe_cleanup <回执文本> [label] [engine=RSRS]；返�
   local out="$1" label="${2:-判重轮}" eng="${3:-$RSRS}" bid
   # 回执识别双兼容：现版英文 "Saved:" ＋ 旧版中文「已存入」——识别失效＝清理被跳过＝测试记录落真库，故两种形态都接住
   printf '%s' "$out" | grep -qF -e "Saved:" -e "已存入" || return 1
-  bid="$(printf '%s' "$out" | sed -n 's/.*(\([0-9a-f]\{8\}\)).*/\1/p')"
+  # 历史中文回执使用全角括号；先规范化，再沿用严格的八位短 id 提取。
+  bid="$(printf '%s' "$out" | sed -n 's/（/(/g;s/）/)/g;s/.*(\([0-9a-f]\{8\}\)).*/\1/p')"
   if [ -z "$bid" ]; then
     echo "  FAIL（兜底清理失效）：$label 回执判直写但未解析出短 id，需手工 rsrs forget"
     return 2

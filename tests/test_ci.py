@@ -319,6 +319,15 @@ print(json.dumps({'status':'ok'}))
         # Actual production format from 4e922e18abb2879f284d043a964a2c90fede2235.
         self.check_receipt('【respire·落库】已存入：fixture（feedface）。rsrs retitle feedface --title', 0, 'feedface')
 
+    def test_english_fullwidth_receipt_calls_only_temporary_forget(self):
+        self.check_receipt('Saved: fixture（deadbeef）. title', 0, 'deadbeef')
+
+    def test_fullwidth_receipt_missing_identifier_fails_without_calls(self):
+        self.check_receipt('已存入：fixture（not-an-id）。', 2)
+
+    def test_fullwidth_receipt_failed_forget_is_reported(self):
+        self.check_receipt('已存入：fixture（feedface）。', 2, 'feedface', 'forget_fail')
+
     def test_missing_identifier_fails_without_calls(self):
         self.check_receipt('Saved: fixture without identifier', 2)
 
