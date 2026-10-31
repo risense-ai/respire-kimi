@@ -10,3 +10,5 @@ hooks/hook.log
 hooks/.nudge_counter
 hooks/.pending_nudge
 dist/
+
+release-out/
