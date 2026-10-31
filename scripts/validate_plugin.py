@@ -97,6 +97,13 @@ if manifest:
         fail(f"manifest version must be plain SemVer: {ver!r}")
     else:
         ok(f"manifest version {ver}")
+    # 运行代码 VERSION 与发布清单一致（不一致=运行行为与发布声明脱节）
+    m_hook = re.search(r'^VERSION\s*=\s*"([^"]+)"', open(os.path.join(ROOT, "hooks", "respire.py"), encoding="utf-8").read(), re.M)
+    hook_ver = m_hook.group(1) if m_hook else None
+    if ver and hook_ver and ver == hook_ver:
+        ok(f"hook VERSION matches manifest ({ver})")
+    else:
+        fail(f"hook VERSION {hook_ver!r} != manifest version {ver!r}")
     if manifest.get("skills") != "./skills/":
         fail('manifest skills must be "./skills/"')
     else:
