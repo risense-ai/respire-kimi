@@ -13,6 +13,7 @@ RSRS="$(command -v rsrs || true)"
 PASS=0; FAIL=0
 WITH_STORE=0
 [ "${1:-}" = "--store" ] && WITH_STORE=1
+wpath() { cygpath -m "$1" 2>/dev/null || printf '%s' "$1"; }   # Windows Python 可见的混合斜杠路径
 
 if [ -z "$RSRS" ] || [ ! -x "$RSRS" ]; then
   echo "SKIP：未找到 rsrs（respire 引擎），无法自测。"; exit 0
@@ -29,7 +30,7 @@ echo '{"session_rules": false}' > "$CFG_OFF"
 # logfile 可换独立文件（凭据守卫断言专用日志，避免与共享 hook.log 互染）；stubmode 只被桩引擎读（真引擎忽略）
 run() {
   local ev="$1" pr="${2-}" cfg="${3:-$CFG_ON}" log="${4:-$TMP/hook.log}" stub="${5:-ok}" pend="$TMP/pending_$RANDOM$RANDOM$RANDOM"
-  "$PY3" - "$ev" "$pr" <<'PY' | RESPITE_CONFIG="$cfg" RESPITE_LOG="$log" RESPITE_NUDGE_STATE="$TMP/nudge" RESPITE_DATA="$TMP/data" RESPITE_PENDING_NUDGE="$pend" STUB_MODE="$stub" "$PY3" "$ROOT/hooks/respire.py" "$ev"
+  "$PY3" - "$ev" "$pr" <<'PY' | RESPITE_CONFIG="$(wpath "$cfg")" RESPITE_LOG="$(wpath "$log")" RESPITE_NUDGE_STATE="$(wpath "$TMP/nudge")" RESPITE_DATA="$(wpath "$TMP/data")" RESPITE_PENDING_NUDGE="$pend" STUB_MODE="$stub" "$PY3" "$ROOT/hooks/respire.py" "$ev"
 import json, sys
 ev, pr = sys.argv[1], sys.argv[2]
 d = {"hook_event_name": ev, "cwd": "/tmp", "session_id": "selftest"}
@@ -42,7 +43,7 @@ PY
 # ss_fixed <pend路径> [config]：固定 pending 路径跑 SessionStart（调用处以环境变量前缀注入 FAKE 后门）
 ss_fixed() {
   local pend="$1" cfg="${2:-$CFG_ON}"
-  RESPITE_CONFIG="$cfg" RESPITE_LOG="$TMP/hook.log" RESPITE_NUDGE_STATE="$TMP/nudge" RESPITE_DATA="$TMP/data" RESPITE_PENDING_NUDGE="$pend" "$PY3" "$ROOT/hooks/respire.py" SessionStart <<'JSON'
+  RESPITE_CONFIG="$(wpath "$cfg")" RESPITE_LOG="$(wpath "$TMP/hook.log")" RESPITE_NUDGE_STATE="$(wpath "$TMP/nudge")" RESPITE_DATA="$(wpath "$TMP/data")" RESPITE_PENDING_NUDGE="$pend" "$PY3" "$ROOT/hooks/respire.py" SessionStart <<'JSON'
 {"hook_event_name":"SessionStart","session_id":"selftest","cwd":"/tmp"}
 JSON
 }
@@ -50,7 +51,7 @@ JSON
 # ps_fixed <pend路径> <prompt> [config]：固定 pending 路径跑 UserPromptSubmit
 ps_fixed() {
   local pend="$1" pr="$2" cfg="${3:-$CFG_ON}"
-  PR="$pr" "$PY3" - <<'PY' | RESPITE_CONFIG="$cfg" RESPITE_LOG="$TMP/hook.log" RESPITE_NUDGE_STATE="$TMP/nudge" RESPITE_DATA="$TMP/data" RESPITE_PENDING_NUDGE="$pend" "$PY3" "$ROOT/hooks/respire.py" UserPromptSubmit
+  PR="$pr" "$PY3" - <<'PY' | RESPITE_CONFIG="$(wpath "$cfg")" RESPITE_LOG="$(wpath "$TMP/hook.log")" RESPITE_NUDGE_STATE="$(wpath "$TMP/nudge")" RESPITE_DATA="$(wpath "$TMP/data")" RESPITE_PENDING_NUDGE="$pend" "$PY3" "$ROOT/hooks/respire.py" UserPromptSubmit
 import json, os, sys
 sys.stdout.write(json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": "selftest",
                              "prompt": os.environ["PR"]}, ensure_ascii=False))
@@ -75,21 +76,42 @@ check() {   # check <名字> <实际输出> <模式: 非空|空|含:xxx|不含:x
 # Stop 节流分支的引擎桩：只回 list --json，fresh=刚落库 / stale=陈旧（真机库随时有人写，不能拿真引擎断言催/不催）
 STUB_FRESH="$TMP/rsrs-fresh"; STUB_STALE="$TMP/rsrs-stale"
 FRESH_TS="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
-cat > "$STUB_FRESH" <<EOF
-#!/usr/bin/env bash
-[ "\${1:-}" = list ] && printf '{"command":"list","status":"ok","details":[{"id":"aaaaaaaaaaaaaaaa","created_at":"$FRESH_TS","updated_at":"$FRESH_TS","title":"fresh","content":"x"}]}'
-exit 0
-EOF
-cat > "$STUB_STALE" <<'EOF'
-#!/usr/bin/env bash
-[ "${1:-}" = list ] && printf '{"command":"list","status":"ok","details":[{"id":"bbbbbbbbbbbbbbbb","created_at":"2020-01-01T00:00:00.000Z","updated_at":"2020-01-01T00:00:00.000Z","title":"stale","content":"x"}]}'
-exit 0
-EOF
-chmod +x "$STUB_FRESH" "$STUB_STALE"
+for _v in fresh stale; do
+  if [ "$_v" = fresh ]; then _ts="$FRESH_TS"; else _ts="2020-01-01T00:00:00.000Z"; fi
+  cat > "$TMP/rsrs-$_v" <<PYEOF
+#!/usr/bin/env python3
+import json, sys
+if (sys.argv[1] if len(sys.argv) > 1 else "") == "list":
+    print(json.dumps({"command": "list", "status": "ok", "details": [
+        {"id": "aaaaaaaaaaaaaaaa" if "$_v" == "fresh" else "bbbbbbbbbbbbbbbb",
+         "created_at": "$_ts", "updated_at": "$_ts", "title": "$_v", "content": "x"}]}))
+PYEOF
+  chmod +x "$TMP/rsrs-$_v"
+done
+# Windows：bash/python 脚本不能被 CreateProcess 直接 exec，包一层 .cmd（解释器回退 py.exe/python.exe）
+if command -v cmd.exe >/dev/null 2>&1; then
+  PY3_WIN="$(cygpath -w "$PY3" 2>/dev/null || echo "$PY3")"
+  for _cand in "py.exe" "python.exe"; do
+    _p="$(dirname "$PY3_WIN")/$_cand"
+    [ -f "$_p" ] && PY3_WIN="$_p" && break
+  done
+  if [ ! -f "$PY3_WIN" ] || [ "${PY3_WIN##*.}" != "exe" ]; then
+    _py="$(command -v py)"
+    [ -n "$_py" ] && PY3_WIN="$(cygpath -w "$_py")"
+  fi
+  [ -f "$PY3_WIN.exe" ] && PY3_WIN="$PY3_WIN.exe"
+  for _v in fresh stale; do
+    cat > "$TMP/rsrs-$_v.cmd" <<WRAP
+@echo off
+"$PY3_WIN" "%~dp0rsrs-$_v" %*
+WRAP
+  done
+  STUB_FRESH="$TMP/rsrs-fresh.cmd"; STUB_STALE="$TMP/rsrs-stale.cmd"
+fi
 CFG_STALE="$TMP/config-stale.json"
-echo '{"session_rules": true, "rsrs": "'"$STUB_STALE"'"}' > "$CFG_STALE"
+echo '{"session_rules": true, "rsrs": "'"$(wpath "$STUB_STALE")"'"}' > "$CFG_STALE"
 CFG_FRESH="$TMP/config-fresh.json"
-echo '{"session_rules": true, "rsrs": "'"$STUB_FRESH"'"}' > "$CFG_FRESH"
+echo '{"session_rules": true, "rsrs": "'"$(wpath "$STUB_FRESH")"'"}' > "$CFG_FRESH"
 
 # ---- python 桩引擎（跨平台）：先登记调用再返回 canned JSON。凭据守卫与兜底清理断言共用：
 # 正向对照必须证明普通输入真调了引擎（不成立即 FAIL，绝不 SKIP），凭据轮才可断言零调用。----
@@ -228,8 +250,9 @@ check "日志脱敏留痕" "$(grep -q 'REDACTED' "$TMP/hook.log" && echo YES)" "
 check "hook.log 留痕" "$(grep -q '"ev": "session"' "$TMP/hook.log" 2>/dev/null && echo YES)" "含:YES"
 
 # Stop 存储检查：<stop_hook_active>（节流断言一律走 stale 引擎桩，保证「仍催」确定性）
+STOP_LOG="$TMP/stop.log"; : > "$STOP_LOG"   # Stop 专用日志：共享 hook.log 可能带 10 分钟窗内的 store-ok 留痕，误触「已落库不再催」
 run_stop() {
-  "$PY3" - "$1" <<'PY' | RESPITE_CONFIG="$CFG_STALE" RESPITE_LOG="$TMP/hook.log" RESPITE_NUDGE_STATE="$TMP/nudge" RESPITE_DATA="$TMP/data" RESPITE_PENDING_NUDGE="$TMP/pending_stop_$RANDOM$RANDOM" "$PY3" "$ROOT/hooks/respire.py" Stop
+  "$PY3" - "$1" <<'PY' | RESPITE_CONFIG="$(wpath "$CFG_STALE")" RESPITE_LOG="$(wpath "$STOP_LOG")" RESPITE_NUDGE_STATE="$(wpath "$TMP/nudge")" RESPITE_DATA="$(wpath "$TMP/data")" RESPITE_PENDING_NUDGE="$(wpath "$TMP/pending_stop_$RANDOM$RANDOM")" "$PY3" "$ROOT/hooks/respire.py" Stop
 import json, sys
 print(json.dumps({"hook_event_name": "Stop", "stop_hook_active": sys.argv[1] == "true"}))
 PY
@@ -242,7 +265,7 @@ CFG_NUDGE0="$TMP/config-nudge0.json"
 echo '{"store_nudge_every": 0}' > "$CFG_NUDGE0"
 run_stop_cfg() {   # $1=config
   local cfg="$1"
-  "$PY3" - <<'PY' | RESPITE_CONFIG="$cfg" RESPITE_LOG="$TMP/hook.log" RESPITE_NUDGE_STATE="$TMP/nudge" RESPITE_DATA="$TMP/data" RESPITE_PENDING_NUDGE="$TMP/pending_stopcfg_$RANDOM$RANDOM" "$PY3" "$ROOT/hooks/respire.py" Stop
+  "$PY3" - <<'PY' | RESPITE_CONFIG="$(wpath "$cfg")" RESPITE_LOG="$(wpath "$STOP_LOG")" RESPITE_NUDGE_STATE="$(wpath "$TMP/nudge")" RESPITE_DATA="$(wpath "$TMP/data")" RESPITE_PENDING_NUDGE="$(wpath "$TMP/pending_stopcfg_$RANDOM$RANDOM")" "$PY3" "$ROOT/hooks/respire.py" Stop
 import json
 print(json.dumps({"hook_event_name": "Stop", "stop_hook_active": False}))
 PY
@@ -250,8 +273,8 @@ PY
 check "Stop 节流关闭静默" "$(run_stop_cfg "$CFG_NUDGE0")" "空"
 check "Stop 引擎近期落库不催" "$(run_stop_cfg "$CFG_FRESH")" "空"
 check "Stop 引擎陈旧落库仍催" "$(run_stop false)" '含:"permissionDecision": "deny"'
-check "引擎放行留痕 src=engine" "$(grep -q 'stored_recent_skip.*src=engine' "$TMP/hook.log" && echo YES)" "含:YES"
-printf '%s\n' '{"ts": "'"$(date +%Y-%m-%dT%H:%M:%S)"'", "ev": "store", "out": "ok", "d": "feed"}' >> "$TMP/hook.log"
+check "引擎放行留痕 src=engine" "$(grep -q 'stored_recent_skip.*src=engine' "$STOP_LOG" && echo YES)" "含:YES"
+printf '%s\n' '{"ts": "'"$(date +%Y-%m-%dT%H:%M:%S)"'", "ev": "store", "out": "ok", "d": "feed"}' >> "$STOP_LOG"
 check "Stop 已存放行放行" "$(run_stop false)" "空"
 CFG_OFFE="$TMP/config-disabled.json"
 echo '{"enabled": false}' > "$CFG_OFFE"
@@ -291,7 +314,7 @@ check "疑似凭据不落库" "$(run UserPromptSubmit "记：数据库密码 = h
 SECRET_LOG="$TMP/secret.log"; : > "$SECRET_LOG"
 : > "$TMP/spy-calls.log"
 CFG_SPY="$TMP/config-spy.json"
-"$PY3" -c 'import json,sys; json.dump({"session_rules": True, "rsrs": sys.argv[1]}, open(sys.argv[2], "w", encoding="utf-8"))' "$SPY" "$CFG_SPY"
+"$PY3" -c 'import json,sys; json.dump({"session_rules": True, "rsrs": sys.argv[1]}, open(sys.argv[2], "w", encoding="utf-8"))' "$(wpath "$SPY")" "$CFG_SPY"
 N0="$(calls_n)"
 OUT="$(run UserPromptSubmit "api_key = ${SYN_KEY} 存一下" "$CFG_SPY" "$SECRET_LOG")"
 check "疑似凭据拦截提示" "$OUT" "含:contains a credential"
@@ -310,7 +333,7 @@ check "裸斜杠不崩溃" "$(run UserPromptSubmit "/")" "空"
 CFG_SKIP="$TMP/config-skip.json"
 echo '{"skip_prefixes": ["recap:", "Weekly recap"]}' > "$CFG_SKIP"
 check "skip_prefixes 命中不召回" "$(run UserPromptSubmit "Recap: 本周完成了 respire 插件移植总结" "$CFG_SKIP")" "空"
-check "坏 stdin 静默" "$(printf 'not-json{{{' | RESPITE_CONFIG="$CFG_ON" RESPITE_LOG="$TMP/hook.log" RESPITE_DATA="$TMP/data" RESPITE_PENDING_NUDGE="$TMP/pending_bad_$RANDOM" "$PY3" "$ROOT/hooks/respire.py" UserPromptSubmit)" "空"
+check "坏 stdin 静默" "$(printf 'not-json{{{' | RESPITE_CONFIG="$(wpath "$CFG_ON")" RESPITE_LOG="$(wpath "$TMP/hook.log")" RESPITE_DATA="$(wpath "$TMP/data")" RESPITE_PENDING_NUDGE="$(wpath "$TMP/pending_bad_$RANDOM")" "$PY3" "$ROOT/hooks/respire.py" UserPromptSubmit)" "空"
 check "未知事件静默" "$(run PreToolUse "rsrs 信封")" "空"
 
 # ---- title 规则抽取（纯函数，零污染） ----
