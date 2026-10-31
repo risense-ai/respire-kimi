@@ -97,26 +97,26 @@ check "README 载三件事(模型可选)" "$(cat "$ROOT/README.md")" "含:不装
 check "README 载标准装法" "$(cat "$ROOT/README.md")" "含:/plugins install"
 check "包内无自定义安装脚本" "$( { [ -e "$ROOT/install.sh" ] || [ -e "$ROOT/uninstall.sh" ]; } && echo PRESENT || echo absent )" "含:absent"
 check "示例配置含 skip_prefixes 字段" "$(grep -q 'skip_prefixes' "$ROOT/hooks/respire.config.example.json" && echo YES)" "含:YES"
-check "SYSTEM 简则载答前必查" "$(cat "$ROOT/SYSTEM.md")" "含:答前必查"
+check "SYSTEM 简则载答前必查" "$(cat "$ROOT/SYSTEM.md")" "含:Recall before answering"
 check "SYSTEM 简则载记前缀与nomem" "$(cat "$ROOT/SYSTEM.md")" "含:/nomem"
 
 # 未登录引导：写挂起文件而非 stdout，首条 prompt 带出后删除
 PEND="$TMP/pending_login"; rm -f "$PEND"
 check "SessionStart 未登录仍静默" "$(RESPITE_FAKE_LOGGED_OUT=1 ss_fixed "$PEND")" "空"
 check "未登录写挂起引导文件" "$( [ -s "$PEND" ] && echo YES || echo NO )" "含:YES"
-check "挂起引导含登录文案" "$(cat "$PEND" 2>/dev/null)" "含:尚未登录"
+check "挂起引导含登录文案" "$(cat "$PEND" 2>/dev/null)" "含:not signed in"
 check "登录引导给出注册与代登法" "$(cat "$PEND" 2>/dev/null)" "含:rsrs login --oauth --no-open"
 PEND_OUT="$(ps_fixed "$PEND" "rsrs 信封 JSON 结构解析取哪层")"
-check "首条 prompt 带出挂起引导" "$PEND_OUT" "含:尚未登录"
-check "带出引导同时仍召回" "$PEND_OUT" "含:自动召回"
+check "首条 prompt 带出挂起引导" "$PEND_OUT" "含:not signed in"
+check "带出引导同时仍召回" "$PEND_OUT" "含:auto-recall"
 check "引导带出后文件已删" "$( [ -e "$PEND" ] && echo PRESENT || echo gone )" "含:gone"
 
 # 裸斜杠命令轮：剥后无实义 → 带出引导、不召回、不崩溃
 PEND2="$TMP/pending_login2"; rm -f "$PEND2"
 RESPITE_FAKE_LOGGED_OUT=1 ss_fixed "$PEND2" >/dev/null
 SL_OUT="$(ps_fixed "$PEND2" "/skill:respire:respire")"
-check "裸斜杠命令轮带出引导" "$SL_OUT" "含:尚未登录"
-check "裸斜杠命令轮不召回" "$SL_OUT" "不含:自动召回"
+check "裸斜杠命令轮带出引导" "$SL_OUT" "含:not signed in"
+check "裸斜杠命令轮不召回" "$SL_OUT" "不含:auto-recall"
 check "裸斜杠命令轮引导文件已删" "$( [ -e "$PEND2" ] && echo PRESENT || echo gone )" "含:gone"
 
 # 引擎缺失分支：monkeypatch find_rsrs→None（真机造不出「全路径皆缺」，走单元注入）
@@ -143,26 +143,26 @@ except SystemExit:
 PY
 }
 check "引擎缺失 SessionStart 静默" "$(run_engineless SessionStart)" "空"
-check "引擎缺失装法落挂起文件" "$(cat "$TMP/pending_eng_SessionStart" 2>/dev/null)" "含:npm i -g @rsrsai/cli"
-check "引导禁自造超级密码" "$(cat "$TMP/pending_eng_SessionStart" 2>/dev/null)" "含:绝不传 --super"
-check "引导要求保存恢复码" "$(cat "$TMP/pending_eng_SessionStart" 2>/dev/null)" "含:务必抄下保存"
-check "引导含注册下一步" "$(cat "$TMP/pending_eng_SessionStart" 2>/dev/null)" "含:rsrs.rs"
-check "引擎缺失落库回装法" "$(run_engineless UserPromptSubmit "记：引擎缺失时的落库")" "含:npm i -g @rsrsai/cli"
+check "引擎缺失装法落挂起文件" "$(cat "$TMP/pending_eng_SessionStart" 2>/dev/null)" "含:npm i -g rsrs-cli"
+check "引导禁自造超级密码" "$(cat "$TMP/pending_eng_SessionStart" 2>/dev/null)" "含:never pass --super"
+check "引导要求保存恢复码" "$(cat "$TMP/pending_eng_SessionStart" 2>/dev/null)" "含:copy and keep it"
+check "引导含注册下一步" "$(cat "$TMP/pending_eng_SessionStart" 2>/dev/null)" "含:rsrs register with the user"
+check "引擎缺失落库回装法" "$(run_engineless UserPromptSubmit "记：引擎缺失时的落库")" "含:npm i -g rsrs-cli"
 
 # 缺模型 / 空库 / 探测失败：引导段落全部落挂起文件
 PEND_M="$TMP/pending_model"; rm -f "$PEND_M"
 RESPITE_FAKE_NO_MODEL=1 ss_fixed "$PEND_M" >/dev/null
 check "缺模型写挂起装法" "$(cat "$PEND_M" 2>/dev/null)" "含:rsrs model activate m3"
-check "缺模型点明词面档" "$(cat "$PEND_M" 2>/dev/null)" "含:词面"
+check "缺模型点明词面档" "$(cat "$PEND_M" 2>/dev/null)" "含:lexical tier"
 PEND_E="$TMP/pending_empty"; rm -f "$PEND_E"
 RESPITE_FAKE_EMPTY=1 ss_fixed "$PEND_E" >/dev/null
-check "空库写挂起引导" "$(cat "$PEND_E" 2>/dev/null)" "含:还是空的"
+check "空库写挂起引导" "$(cat "$PEND_E" 2>/dev/null)" "含:memory store is empty"
 check "空库引导含 Kimi 导入线索" "$(cat "$PEND_E" 2>/dev/null)" "含:~/.kimi-code/AGENTS.md"
 check "空库引导含技能导入线索" "$(cat "$PEND_E" 2>/dev/null)" "含:~/.agents/skills/*/SKILL.md"
 PEND_F="$TMP/pending_probe"; rm -f "$PEND_F"
 RESPITE_FAKE_PROBE_FAIL=1 ss_fixed "$PEND_F" >/dev/null
-check "探测失败写挂起诊断段" "$(cat "$PEND_F" 2>/dev/null)" "含:状态探测失败"
-check "probe失败含未注册分支" "$(cat "$PEND_F" 2>/dev/null)" "含:尚未注册"
+check "探测失败写挂起诊断段" "$(cat "$PEND_F" 2>/dev/null)" "含:status probe failed"
+check "probe失败含未注册分支" "$(cat "$PEND_F" 2>/dev/null)" "含:never registered"
 PEND_R="$TMP/pending_rules"; rm -f "$PEND_R"
 RESPITE_FAKE_LOGGED_OUT=1 ss_fixed "$PEND_R" "$CFG_OFF" >/dev/null
 check "session_rules=false 不写挂起引导" "$( [ -e "$PEND_R" ] && echo PRESENT || echo absent )" "含:absent"
@@ -209,12 +209,12 @@ check "enabled=false 落库也静默" "$(run UserPromptSubmit "记：关断时�
 out=$(run UserPromptSubmit "rsrs 信封 JSON 结构解析取哪层")
 check "相关 prompt 触发召回" "$out" "非空"
 check "注入为标题档无正文" "$out" "不含:｜"
-check "默认直出无阈值拦截" "$out" "含:rsrs 直出"
+check "默认直出无阈值拦截" "$out" "含:rsrs direct"
 check "召回头行与条数一致" "$(printf '%s' "$out" | python3 -c '
 import re,sys
 s=sys.stdin.read(); head=s.split("\n",1)[0]
 n=sum(1 for l in s.split("\n") if l.startswith("- ["))
-m=re.search(r"命中 (\d+)",head)
+m=re.search(r"matched (\d+) item",head)
 print("OK" if m and int(m.group(1))==n else "BAD")')" "含:OK"
 
 CFG_BUDGET="$TMP/config-budget.json"
@@ -227,7 +227,9 @@ print(sum(1 for l in s.split("\n") if l.startswith("- [")))')" "含:1"
 check "无关 prompt 不注入" "$(run UserPromptSubmit "今晚吃什么菜好呢")" "空"
 check "单字 prompt 跳过" "$(run UserPromptSubmit "嗯")" "空"
 check "/nomem 关闭召回" "$(run UserPromptSubmit "/nomem rsrs 信封结构")" "空"
-check "斜杠命令剥前缀仍召回" "$(run UserPromptSubmit "/respire:recall rsrs 信封 JSON 结构解析取哪层")" "含:自动召回"
+check "疑似凭据不发引擎" "$(run UserPromptSubmit "api_key = sk-abcdefghijklmnopqrst 存一下")" "含:contains a credential"
+check "疑似凭据不落库" "$(run UserPromptSubmit "记：数据库密码 = hunter2u")" "含:contains a credential"
+check "斜杠命令剥前缀仍召回" "$(run UserPromptSubmit "/respire:recall rsrs 信封 JSON 结构解析取哪层")" "含:auto-recall"
 check "斜杠命令整轮不召回不崩溃" "$(run UserPromptSubmit "/respire:recall")" "空"
 check "裸斜杠不崩溃" "$(run UserPromptSubmit "/")" "空"
 CFG_SKIP="$TMP/config-skip.json"
@@ -256,9 +258,9 @@ if [ "$WITH_STORE" = 1 ]; then
   # 内容须与全库零语义关联：纯随机无义串（域词如「探针/测试/记忆」会撞 30%+ 相似走待决态）
   MARK="zq$(date +%s)$RANDOM kw7f2 随机标记无义串"
   out=$(run UserPromptSubmit "记：$MARK")
-  check "落库成功回执" "$out" "含:已存入"
+  check "落库成功回执" "$out" "含:Saved:"
   check "回执约束AI抽事实句retitle" "$out" "含:rsrs retitle"
-  SID=$(printf '%s' "$out" | sed -n 's/.*（\([0-9a-f]\{8\}\)）.*/\1/p')
+  SID=$(printf '%s' "$out" | sed -n 's/.*(\([0-9a-f]\{8\}\)).*/\1/p')
   check "回执带短 id" "$SID" "非空"
   if [ -n "$SID" ]; then
     rc=$(rsrs forget "$SID" --json 2>/dev/null | jq -r '.status // "err"')
@@ -266,11 +268,11 @@ if [ "$WITH_STORE" = 1 ]; then
   fi
   # 判重待决：复述库中稳定条目（1memory 更名 respire）→ 必撞高相似 → pending 未写入
   out=$(run UserPromptSubmit "记：1memory 更名 respire：吸即存呼即取，材料全线改（复述既有条目触发判重待决）")
-  check "判重待决转述候选" "$out" "含:落库待决"
+  check "判重待决转述候选" "$out" "含:store pending"
   check "待决列出候选与决断法" "$out" "含:--force"
   # 兜底：万一判为直写（库条变更），清掉探针不留垃圾
   if printf '%s' "$out" | grep -qF "已存入"; then
-    BID=$(printf '%s' "$out" | sed -n 's/.*（\([0-9a-f]\{8\}\)）.*/\1/p')
+    BID=$(printf '%s' "$out" | sed -n 's/.*(\([0-9a-f]\{8\}\)).*/\1/p')
     [ -n "$BID" ] && rsrs forget "$BID" --json >/dev/null 2>&1
     echo "  （注：该条被判直写而非待决，已兜底清理 $BID）"
   fi

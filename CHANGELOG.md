@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1 — 2026-10-31 · 提示词英文化（dimcode 同款）＋疑似凭据拦截
+
+- 模型可见文本全量英文化：hook 注入段（NO_RSRS / LOGIN_NUDGE / EMPTY_NUDGE / NO_MODEL / PROBE_FAIL / STORE_NUDGE）、落库回执、召回头行、SYSTEM.md 常驻简则、commands（recall/store/sync）、SKILL.md 全部改英文（dimcode 0.5.6 同款）；「记：」等中文前缀兼容不变；SKILL.md 触发词保留中文。
+- 新增输入侧疑似凭据扫描（`contains_secret`）：命中 prompt 不召回也不落库，注入 `SECRET_SKIP` 提示。
+- 安装与注册口径对齐 CLI 现状：`rsrs-cli@latest`；本机 `rsrs register` 直注、无网站步骤（含插件清单 description / longDescription 修正）。
+- 测试断言随英文输出同步，新增疑似凭据两条。
+
 ## 0.1.0 — 2026-10-23 · 初始 Kimi Code 移植
 
 - 以 respire-dimcode hooks/respire.py 0.5.4 为功能基线（含 `engine_last_store()` 问库节流、`data_dir()` 链、`skip_prefixes` 白名单），注入/回执文案全中文（沿用 workbuddy 措辞，`EMPTY_NUDGE` 导入线索改指 `~/.kimi-code/AGENTS.md` 与 `~/.agents/skills/*/SKILL.md`）

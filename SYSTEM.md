@@ -1,13 +1,13 @@
-# respire 记忆层 · 常驻简则
+# respire memory layer · persistent brief rules
 
-① 答前必查：`rsrs recall "<项目名+核心词>" --titles --json`；每回合首次 recall 后先读 `rsrs prompt` 全文再动手。插件每轮已自动注入标题档召回；未见注入、命中不贴题、或话题涉旧（项目/报错/约定/日期）→ 换 2–3 组词补查再答（同义词、上位词、英文对应词各试一路），可见地调用。
+① Recall before answering: `rsrs recall "<project name + core keywords>" --titles --json`; after the first recall of every round, read the full `rsrs prompt` before acting. The plugin already injects title-tier recall with each prompt; if no injection is present, the hits are off-topic, or the topic involves an earlier project/error/agreement/date → recall again with 2–3 different wordings before answering (try synonyms, hypernyms, and English equivalents, one route each), and call it visibly.
 
-② 收尾必存：经验/决策/教训 `rsrs remember "<正文>" --title "<事实句>" --importance important --parent <挂点id>`；琐事 `--importance trivial`；标题写「主语＋动作＋结果」完整事实句，禁主题分类名、禁硬截断；存前判重（先 recall），改＞并＞挂＞存。
+② Store when wrapping up: for experience/decisions/lessons run `rsrs remember "<content>" --title "<fact sentence>" --importance important --parent <attach-id>`; for trivia use `--importance trivial`; the title is a complete "subject + action + result" fact sentence — never a topic label, never truncated; check dedup before storing (recall first), prefer edit > merge > attach > new.
 
-③ 遇障先翻忆：报错/异常/行为不符预期，先 `rsrs recall "<项目+组件+报错原文>" --json` 再动手，禁先试错。
+③ On trouble, recall first: on errors/anomalies/unexpected behavior, run `rsrs recall "<project + component + original error text>" --json` before acting; never trial-and-error first.
 
-④ 写前敏感审查：禁存明文密码、API token、私钥及不必要的个人敏感信息，只存安全的用途/位置指针；查询词同样禁带秘密。
+④ Sensitive review before writing: never store plaintext passwords, API tokens, private keys, or unnecessary personal data — record only a safe purpose/location pointer; keep secrets out of query terms too.
 
-⑤ 引擎运维：`rsrs status` 查态、`rsrs sync` 同步；完整细则以 `rsrs prompt` 全文为准，深用法见 respire 技能。
+⑤ Engine upkeep: `rsrs status` checks state, `rsrs sync` syncs; the full policy in `rsrs prompt` prevails, advanced usage lives in the respire skill.
 
-「记：」/「remember:」前缀由插件直接落库并回执；「/nomem」前缀本轮不召回。
+Prompts starting with "记：" / "remember:" are stored directly by the plugin with a receipt; the "/nomem" prefix disables recall for this turn.

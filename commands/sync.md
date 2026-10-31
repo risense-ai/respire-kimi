@@ -1,9 +1,9 @@
 ---
-description: 同步：rsrs sync 双向同步记忆库并查态，回报简要摘要
+description: Sync: run rsrs sync two-way sync plus status check, report a brief summary
 ---
 
-请执行 respire 记忆同步与查态（rsrs CLI）：
+Run the respire memory sync and status check (rsrs CLI):
 
-1. 运行 `rsrs sync`，等待完成（同步失败也把报错原文带出来）。
-2. 运行 `rsrs status --json`，解析登录态、本地库量、同步位点与模型档。
-3. 用三五句中文向用户回报：是否已登录、本地/云端各多少条、同步是否成功、有无待处理异常；异常给出下一步建议（未登录→rsrs.rs 注册后 rsrs register；探测失败→rsrs doctor）。
+1. Run `rsrs sync` and wait for completion (if sync fails, relay the original error text).
+2. Run `rsrs status --json` and parse the login state, local store size, sync position, and model tier.
+3. Report back to the user in three to five sentences: signed in or not, local/cloud record counts, whether sync succeeded, and any pending anomalies; for anomalies suggest next steps (not signed in → `rsrs register` on this machine; probe failure → `rsrs doctor`).
