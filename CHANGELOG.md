@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.4 — 2026-11-01 · 维护者复审整改（5 项＋回读附注）
+
+### Fixed
+
+- **KM-06 每会话原子一次收尾锁（复审#1）**：`.store_turn` 单文件共享状态改为**每会话独立锁文件**（`O_CREAT|O_EXCL` 原子独占——并发/交错会话 Stop 只有一个能落锁，A→B→A 不丢锁、不覆盖他人凭证）；无法落锁（状态目录不可写、被同名文件挡住等）一律放行——**绝不无锁 block**，状态写入失败不假装保险已生效；prompt_ts/store_ts 移入尽力维护的 per-session map（temp+rename 原子替换，仅按数量收敛、不按时间失效），map 失败只损失免催优化，不影响一次上限保证。
+- **KM-07 锁不设 TTL（复审#2）**：600 秒过期使「每请求至多一次」失效——锁一经占用只有新真实 prompt（`mark_prompt`）删除重新武装；601 秒后、重复 Stop、交错会话均不再 deny；`/nomem` 仍算新请求（mark 提前到 /nomem 判断之前），只跳召回不跳重武装。
+- **KM-08 回执/回读加固（复审#3＋附注）**：`ok`/`warn` 缺有效 id（hex/uuid 白名单校验）、畸形 summary（类型防护不抛异常）、未知 status 一律归 **unknown**（只读核实＋禁重发，不当失败也不当成功）；`skip`=引擎按当前模式拒绝（未写非失败），仅 `fail` 断言未接受。回读改**全量核验**：返回 id 必须=写入 id、标题相等、完整正文相等才称 verified；错误 id/同前缀不同尾部 → mismatch 如实标注。
+- **KM-09 共享 hook 预算（复审#4）**：remember/回读/只读核实共用一条截止时间（`RESPITE_HOOK_BUDGET_S`，默认 20s，预留 2.5s 输出余量）——慢坏回执后剩余不足直接 unknown，不再无预算判断地追加 list（旧 18s+6s 可超 20s hook 上限，unknown/禁重发提示可能来不及输出）。
+- **KM-10 免催只认可归属凭证（复审#5）**：移除「引擎全库最新写入晚于本轮 prompt 即免催」（无法归属会话/请求——其他会话并行写入会误抑制本会话）；`Stop` **完全不查询引擎**（删 `engine_last_store` 全库时间免催链路），也因此不存在查库失败强迫续跑/放行的路径。
+
+### Changed
+
+- 测试：CI 38/38（+复审反例：缺 id/垃圾 id/坏 summary→unknown、skip 回执、错 id/尾部篡改回读→mismatch、慢坏回执+紧预算→零追加调用、坏 schema list 不归属、A→B→A 锁不丢、锁无 TTL、状态不可写放行、Stop 零引擎查询）；bash 89/0（fresh 场景翻转为仍催；新增不可写目录放行、25 小时锁仍占用、/nomem 重武装、单次 nudge 计数；留痕 grep 改 `once_latch_skip`）。`.gitignore` 增 `.latch_*`/`turn_map.json`（运行期锁/凭证文件不进仓）。
+
 ## 0.1.3 — 审计整改：写结果状态机＋Stop fail-open＋请求级免催凭证（KM-01~KM-05）
 
 ### Fixed
@@ -14,7 +28,6 @@
 
 - 测试：CI 白名单升级为有序调用序列（remember→show），spy 支持 warn/pending/silent/hang/show_mismatch；新增 8 个契约测试并翻转 failed→deny 旧错误期望（33/33）。bash 套件：fresh 桩改动态毫秒时间戳、增 bad 桩（fail-open）、Stop 场景化复位、PR env 传 prompt（修 MSYS 路径转换）、heredoc 走 stdout.buffer（修 Windows 码页乱码）、title 路径 wpath 化（75/6 → 85/0，--store 89/0）。`RESPITE_TEST_FAST`/`RESPITE_TURN_STATE` 测试后门；`.gitignore` 增 `.store_turn`。
 
-## 0.1.1 — 2026-10-31 · 提示词英文化（dimcode 同款）＋疑似凭据拦截
 ## 0.1.1 — 2026-10-31 · 提示词英文化（dimcode 同款）＋疑似凭据拦截
 
 - 模型可见文本全量英文化：hook 注入段（NO_RSRS / LOGIN_NUDGE / EMPTY_NUDGE / NO_MODEL / PROBE_FAIL / STORE_NUDGE）、落库回执、召回头行、SYSTEM.md 常驻简则、commands（recall/store/sync）、SKILL.md 全部改英文（dimcode 0.5.6 同款）；「记：」等中文前缀兼容不变；SKILL.md 触发词保留中文。

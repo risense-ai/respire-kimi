@@ -29,10 +29,10 @@ echo '{"session_rules": false}' > "$CFG_OFF"
 
 # run <event> [prompt] [config] [logfile] [stubmode] —— 每次调用独立 pending 路径，杜绝测试间挂起引导互染；
 # logfile 可换独立文件（凭据守卫断言专用日志，避免与共享 hook.log 互染）；stubmode 只被桩引擎读（真引擎忽略）；
-# prompt 走 PR env（MSYS 会把「/nomem …」argv 转成 Windows 路径，env 值不转）；turn 状态文件独立供 Stop 场景复位
+# prompt 走 PR env（MSYS 会把「/nomem …」argv 转成 Windows 路径，env 值不转）；turn 状态目录独立供 Stop 场景复位
 run() {
   local ev="$1" pr="${2-}" cfg="${3:-$CFG_ON}" log="${4:-$TMP/hook.log}" stub="${5:-ok}" pend="$TMP/pending_$RANDOM$RANDOM$RANDOM"
-  PR="$pr" "$PY3" - "$ev" <<'PY' | PR="$pr" RESPITE_CONFIG="$(wpath "$cfg")" RESPITE_LOG="$(wpath "$log")" RESPITE_NUDGE_STATE="$(wpath "$TMP/nudge")" RESPITE_TURN_STATE="$(wpath "$TMP/turn.json")" RESPITE_DATA="$(wpath "$TMP/data")" RESPITE_PENDING_NUDGE="$pend" STUB_MODE="$stub" "$PY3" "$ROOT/hooks/respire.py" "$ev"
+  PR="$pr" "$PY3" - "$ev" <<'PY' | PR="$pr" RESPITE_CONFIG="$(wpath "$cfg")" RESPITE_LOG="$(wpath "$log")" RESPITE_NUDGE_STATE="$(wpath "$TMP/nudge")" RESPITE_TURN_STATE="$(wpath "$TMP")/turnstate" RESPITE_DATA="$(wpath "$TMP/data")" RESPITE_PENDING_NUDGE="$pend" STUB_MODE="$stub" "$PY3" "$ROOT/hooks/respire.py" "$ev"
 import json, os, sys
 ev = sys.argv[1]
 pr = os.environ.get("PR", "")
@@ -282,11 +282,11 @@ run UserPromptSubmit "/nomem 口令: hunter2 这条走 nomem_or_empty 落详情"
 check "日志脱敏留痕" "$(grep -q 'REDACTED' "$TMP/hook.log" && echo YES)" "含:YES"
 check "hook.log 留痕" "$(grep -q '"ev": "session"' "$TMP/hook.log" 2>/dev/null && echo YES)" "含:YES"
 
-# Stop 存储检查（审计新契约：fail-open / 请求级凭证 / 一次收尾锁；每场景 rst 复位轮次状态与节流计数）
+# Stop 存储检查（复审新契约：不查引擎 / 免催只认可归属凭证 / 每会话原子一次收尾锁；每场景 rst 复位轮次状态与节流计数）
 STOP_LOG="$TMP/stop.log"; : > "$STOP_LOG"
-rst() { rm -f "$TMP/turn.json" "$TMP/nudge"; }
+rst() { rm -rf "$TMP/turnstate" "$TMP/nudge"; }
 run_stop() {   # run_stop <stop_hook_active> [config]
-  "$PY3" - "$1" <<'PY' | RESPITE_CONFIG="$(wpath "${2:-$CFG_STALE}")" RESPITE_LOG="$(wpath "$STOP_LOG")" RESPITE_NUDGE_STATE="$(wpath "$TMP/nudge")" RESPITE_TURN_STATE="$(wpath "$TMP/turn.json")" RESPITE_DATA="$(wpath "$TMP/data")" RESPITE_PENDING_NUDGE="$(wpath "$TMP/pending_stop_$RANDOM$RANDOM")" "$PY3" "$ROOT/hooks/respire.py" Stop
+  "$PY3" - "$1" <<'PY' | RESPITE_CONFIG="$(wpath "${2:-$CFG_STALE}")" RESPITE_LOG="$(wpath "$STOP_LOG")" RESPITE_NUDGE_STATE="$(wpath "$TMP/nudge")" RESPITE_TURN_STATE="$(wpath "$TMP")/turnstate" RESPITE_DATA="$(wpath "$TMP/data")" RESPITE_PENDING_NUDGE="$(wpath "$TMP/pending_stop_$RANDOM$RANDOM")" "$PY3" "$ROOT/hooks/respire.py" Stop
 import json, sys
 sys.stdout.buffer.write(json.dumps({"hook_event_name": "Stop", "session_id": "selftest",
                                     "stop_hook_active": sys.argv[1] == "true"}).encode("utf-8"))
@@ -306,10 +306,31 @@ rst; run UserPromptSubmit "next real question" >/dev/null
 check "新请求重新武装仍催" "$(run_stop false)" '含:"permissionDecision": "deny"'
 rst; check "无请求凭证时引擎新写入仍催(不跨轮误抑制)" "$(run_stop false "$CFG_FRESH")" '含:"permissionDecision": "deny"'
 rst; run UserPromptSubmit "turn with engine store" >/dev/null
-check "引擎写入晚于本轮prompt免催" "$(run_stop false "$CFG_FRESH")" "空"
-check "引擎放行留痕 src=engine" "$(grep -q 'stored_recent_skip.*src=engine' "$STOP_LOG" && echo YES)" "含:YES"
-rst; check "查库坏信封fail-open放行(旧代码会催)" "$(run_stop false "$CFG_BAD")" "空"
-check "fail-open 留痕" "$(grep -q 'engine_query_fail_open' "$STOP_LOG" && echo YES)" "含:YES"
+# 复审整改：Stop 不再查询引擎——引擎侧写入（无法归属会话）不再免催，也没有查库失败放行路径
+check "引擎写入晚于prompt不再免催(去无归属抑制)" "$(run_stop false "$CFG_FRESH")" '含:"permissionDecision": "deny"'
+NUDGE_N0="$(grep -c '"ev": "stop", "out": "nudge"' "$STOP_LOG" 2>/dev/null)"; NUDGE_N0="${NUDGE_N0:-0}"
+run UserPromptSubmit "arm single nudge count" >/dev/null
+run_stop false "$CFG_FRESH" >/dev/null
+NUDGE_N1="$(grep -c '"ev": "stop", "out": "nudge"' "$STOP_LOG" 2>/dev/null)"; NUDGE_N1="${NUDGE_N1:-0}"
+check "Stop 不再发起引擎查询(单次nudge)" "$( [ $((NUDGE_N1 - NUDGE_N0)) = 1 ] && echo ONE || echo MANY )" "含:ONE"
+rst; check "查库坏信封不再影响Stop(不查引擎)" "$(run_stop false "$CFG_BAD")" '含:"permissionDecision": "deny"'
+# 状态目录被同名文件挡住 → 无法落锁 → 放行（绝不无锁 block）
+rm -rf "$TMP/not-a-dir"; printf 'x' > "$TMP/not-a-dir"
+rst
+check "状态目录不可写时放行(绝不无锁block)" "$(printf '%s' '{"hook_event_name": "Stop", "session_id": "selftest", "stop_hook_active": false}' | RESPITE_CONFIG="$(wpath "$CFG_STALE")" RESPITE_LOG="$(wpath "$STOP_LOG")" RESPITE_NUDGE_STATE="$(wpath "$TMP/nudge")" RESPITE_TURN_STATE="$(wpath "$TMP")/not-a-dir/sub" RESPITE_DATA="$(wpath "$TMP/data")" RESPITE_PENDING_NUDGE="$(wpath "$TMP/pending_stop_block")" "$PY3" "$ROOT/hooks/respire.py" Stop)" "空"
+rm -f "$TMP/not-a-dir"
+check "fail-open 留痕(锁不可落)" "$(grep -q 'once_latch_skip' "$STOP_LOG" && echo YES)" "含:YES"
+# 锁不设 TTL：25 小时前的锁仍占用，只有新 prompt 重新武装
+rst; run_stop false >/dev/null
+OLDLATCH="$(ls "$TMP"/turnstate/.latch_* 2>/dev/null | head -1)"
+if [ -n "$OLDLATCH" ]; then printf '{"ts":100}' > "$OLDLATCH"; fi
+check "25小时前的锁仍占用(无TTL)" "$( [ -n "$OLDLATCH" ] && out="$(run_stop false)" && [ -z "$out" ] && echo HELD || echo LOST )" "含:HELD"
+run UserPromptSubmit "re-arm after aged latch" >/dev/null
+check "新请求重新武装后仍可催" "$(run_stop false)" '含:"permissionDecision": "deny"'
+# /nomem 只跳召回，仍是新请求（重新武装收尾锁）
+rst; run_stop false >/dev/null
+run UserPromptSubmit "/nomem skip recall only" >/dev/null
+check "/nomem 轮重新武装收尾锁" "$(run_stop false)" '含:"permissionDecision": "deny"'
 check "一次收尾锁留痕" "$(grep -q 'once_latch_skip' "$STOP_LOG" && echo YES)" "含:YES"
 CFG_OFFE="$TMP/config-disabled.json"
 echo '{"enabled": false}' > "$CFG_OFFE"
