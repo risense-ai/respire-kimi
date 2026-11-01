@@ -38,8 +38,8 @@
 | 会话全程 | `systemPromptPath`（SYSTEM.md）常驻系统提示：答前必查、收尾必存、遇障先翻忆、敏感红线五条简则 |
 | `SessionStart`（startup/resume） | 加载 `skills/respire` playbook 技能进主 agent；同时做一次状态探测——引擎未装/未登录/库空/缺模型时的引导**写入 `.pending_nudge` 状态文件**（Kimi SessionStart 输出不进模型上下文），由首个 UserPromptSubmit 置顶带出后即删 |
 | `UserPromptSubmit` | 自动 `rsrs recall --titles`：**标题档注入**——只给分数＋8 位短 id＋标题，正文由 agent `rsrs show <id>` 按需取；默认**直出不过滤**，噪音边界＝rsrs skip 门＋limit 5＋标题档；斜杠命令 token（`/skill:…`、`/respire:…`）自动剥除后再召回 |
-| `prompt` 以「记：」「存：」「remember:」开头 | 直接 `rsrs remember … --importance important` 落库并回执；判后即存判为相似时**不写入**、回执转述候选（`--parent` 挂靠或 `--force` 直写），由模型决断；回执硬约束 AI 抽「主语＋动作＋结果」事实句 `retitle` 替换暂拟题 |
-| `Stop`（AI 干完活） | **存储检查**：以 `hookSpecificOutput.permissionDecision:"deny"` JSON 续跑一轮，提示模型把本轮新的**事实/决定/约定/教训/踩坑**分条 `rsrs remember`（事实句标题、判重先决断）；闲聊无新事实则直接结束。规范防循环：续跑轮 `stop_hook_active=true` 即放行；节流 `store_nudge_every`（默认 1=每轮，N=每 N 轮，0=关）；近 10 分钟本库有过落库（先扫本层 hook.log，再问引擎 `list` 取最近 `updated_at`，覆盖 agent 直接 `rsrs remember`）则不再催 |
+| `prompt` 以「记：」「存：」「remember:」开头 | 直接 `rsrs remember … --importance important` 落库并回执，**回执按结果状态机**：`ok`/`warn` → **已写入**（warn 附引擎警告如 parent 未解析——不误报失败、不引导重发），随后 `show` 写后回读核验（verified / mismatch / unavailable 如实标注）；`pending` → **未写入**，转述候选（带短 id）＋引擎建议动作（改＞并＞挂＞存全量转达，先 `show` 读候选正文再决断）；超时/坏回执 → **结果未知**，回执只允许只读核实（`rsrs list`/`rsrs show`）并**明令禁止重发**（重复写风险；`ok`/`warn` 缺有效 id、畸形 summary 也归 unknown，不当失败也不当成功。**有效 id 严格白名单**＝原生字符串的完整 UUID 或 16+ 位纯 hex——JSON 数字 id、宽松字符可过的畸形串（`a-------`、分组非法的 UUID）都不是写入凭证，一律归 unknown）；写后回读为**全量核验**——返回 id＋标题＋完整正文一致才称 verified，错 id/尾部不一致如实标 mismatch；remember/回读/只读核实**共享 hook 时间预算**（默认 20s），剩余不足直接 unknown 不追加引擎调用。回执硬约束 AI 抽「主语＋动作＋结果」事实句 `retitle` 替换暂拟题 |
+| `Stop`（AI 干完活） | **存储检查**：以 `hookSpecificOutput.permissionDecision:"deny"` JSON 续跑一轮，提示模型把本轮新的**事实/决定/约定/教训/踩坑**分条 `rsrs remember`（事实句标题、判重先决断）；闲聊无新事实则直接结束。**每个真实请求至多催一次**：续跑轮 `stop_hook_active=true` 放行 ＋ **每会话原子一次收尾锁**（`O_EXCL` 独占创建，无 TTL——25 小时后仍占用；只有新真实 prompt 删除重新武装，`/nomem` 轮同样重武装；无法落锁一律放行，绝不无锁 block；会话间互不干扰，A→B→A 交错不丢锁）。**不再凭磁盘写回执免催**：状态 map 仅作诊断轨迹，旧快照回滚不影响 Stop 决策。显式保存成功后仍会提示一次有界收尾；模型如何结束尚未真实宿主验收。`Stop` **完全不查询引擎**，也因此不存在查库失败强迫续跑的路径。节流 `store_nudge_every`（1=每轮，0=关，N=每 N 轮） |
 | `prompt` 以 `/nomem` 开头 | 本轮跳过召回 |
 | 快捷指令 | `/respire:recall <词>`、`/respire:store <内容>`、`/respire:sync`；技能本身经 `/skill:respire:respire` 唤起 |
 
@@ -118,3 +118,7 @@ GitHub Actions 在 Linux、Windows、macOS 上运行结构校验、临时桩行�
 通过审核后的 `vMAJOR.MINOR.PATCH` 标签触发发布，ZIP 保留插件根目录布局并附带 SHA256SUMS。安装仍使用本文原有仓库安装说明。恢复已存在标签时，从 main 手动运行工作流并提供标签及其完整提交 SHA；只归档该提交，不移动标签，不覆盖冲突资产。构建默认只读，写权限仅在受控发布 job 内使用仓库 GITHUB_TOKEN，无新增 secret。
 
 这些测试不能代替真实 Kimi 宿主、安装后的解释器回退或真实引擎验收；任何版本或回执兼容测试失败都阻止发布。
+
+### Stop verification boundary
+
+Stop never queries the engine and can deny only once until a new non-internal UserPromptSubmit rearms its session latch. Internal `skip_prefixes` inputs do not rearm it; `/nomem` remains a real input. No undocumented request-ID field is assumed: an older host replaying UserPromptSubmit without a stable request identity is treated as another delivery. Real host event dispatch and model termination have not been independently tested.

@@ -29,22 +29,46 @@ def allowed_process(executable, argv, expected_argv, windows):
 
 # Run the unmodified hook with a subprocess allowlist. A failure cannot silently
 # fall through to a real rsrs executable, even on machines where one is installed.
+# TEST_EXPECTED_ARGV is an ORDERED SEQUENCE of argv lists: every subprocess must
+# match the next expected invocation exactly (store legitimately chains
+# remember -> show read-back / remember -> list verification).
 LAUNCHER = r'''
-import json, os, pathlib, runpy, sys
+import json, os, pathlib, runpy, subprocess, sys
 case = pathlib.Path(os.environ['RESPITE_CONFIG']).resolve().parent
 expected = os.environ['TEST_ENGINE']
 expected_argv = json.loads(os.environ['TEST_EXPECTED_ARGV'])
-assert expected_argv[0] == expected
+assert isinstance(expected_argv, list)  # Empty sequence strictly requires zero child processes.
+for argv in expected_argv:
+    assert isinstance(argv, list) and argv[0] == expected
 config = json.loads(pathlib.Path(os.environ['RESPITE_CONFIG']).read_text(encoding="utf-8"))
 assert config['rsrs'] == expected and os.access(expected, os.X_OK)
 sys.path.insert(0, str(pathlib.Path(os.environ['TEST_HOOK']).parents[1] / 'tests'))
 from test_ci import allowed_process
+state = {'next': 0}
+owned = set()
+original_popen = subprocess.Popen
+def tracked_popen(*args, **kwargs):
+    child = original_popen(*args, **kwargs)
+    if isinstance(child.args, (list, tuple)) and child.args[0] == expected:
+        owned.add(child.pid)
+    return child
+subprocess.Popen = tracked_popen
 def audit(event, args):
     if event == 'subprocess.Popen':
         executable, argv, cwd, env = args
-        if not allowed_process(executable, argv, expected_argv, os.name == 'nt'):
+        if os.name == 'nt':
+            taskkill = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'taskkill.exe')
+            for pid in owned:
+                cleanup = [taskkill, '/PID', str(pid), '/T', '/F']
+                if allowed_process(executable, argv, cleanup, True):
+                    with pathlib.Path(os.environ['TEST_CLEANUP']).open('a', encoding='utf-8') as f:
+                        f.write(str(pid)+'\n')
+                    return
+        index = state['next']
+        if index >= len(expected_argv) or not allowed_process(executable, argv, expected_argv[index], os.name == 'nt'):
             pathlib.Path(os.environ['TEST_DENIED']).write_text('unexpected subprocess')
             raise SystemExit(91)
+        state['next'] += 1
     elif event.startswith('socket.') or event in ('os.system', 'os.posix_spawn', 'os.exec'):
         pathlib.Path(os.environ['TEST_DENIED']).write_text('unexpected external action')
         raise SystemExit(92)
@@ -63,22 +87,89 @@ class CredentialGuard(unittest.TestCase):
         self.calls = self.case / 'calls.jsonl'
         self.log = self.case / 'hook.log'
         self.denied = self.case / 'denied'
-        self.spy.write_text(r'''import json, os, sys, datetime
+        self.spy.write_text(r'''import json, os, sys, datetime, time
 with open(os.environ['TEST_CALLS'], 'a', encoding='utf-8') as f:
     f.write(json.dumps(sys.argv[1:]) + '\n')
 sub = sys.argv[1]
 mode = os.environ.get('STUB_MODE', 'ok')
+list_mode = os.environ.get('STUB_LIST', mode)
 if mode == 'dead': sys.exit(7)
 if mode == 'malformed': print('not json'); sys.exit(0)
+if mode in ('hang', 'hang_tree'):
+    from pathlib import Path
+    Path(os.environ['TEST_CHILD_PID']).write_text(str(os.getpid()), encoding='utf-8')
+    if mode == 'hang_tree':
+        import subprocess
+        subprocess.Popen([sys.executable, '-c', "import os,time;from pathlib import Path;Path(os.environ['TEST_GRANDCHILD_PID']).write_text(str(os.getpid()),encoding='utf-8');time.sleep(30)"])
+    time.sleep(30)
 if sub == 'recall':
     print(json.dumps({'status':'ok','details':[{'id':'cccccccccccccccc','title':'spy','score':0.9}]}))
 elif sub == 'remember':
-    print(json.dumps({'status':'ok','summary':{'id':'dddddddddddddddd'}}))
+    if mode == 'warn':
+        print(json.dumps({'status':'warn','summary':{'action':'created','id':'eeeeeeeeeeeeeeee'},
+                          'errors':['parent (cause) cannot be resolved; stored independently']}))
+        sys.exit(2)
+    if mode == 'pending':
+        print(json.dumps({'status':'pending','summary':{'state':'candidates','written':False},
+                          'items':[{'name':'aaaabbbb','status':'pending',
+                                    'value':'similarity=88% title=stub candidate',
+                                    'action':'merge or attach'}],
+                          'actions':['rsrs remember "<combined content>" --merge-ids "aaaabbbb"',
+                                     'rsrs remember "<content>" --parent <candidate id>',
+                                     'rsrs remember "<content>" --force to write as new entry']}))
+        sys.exit(2)
+    if mode == 'silent': sys.exit(0)
+    if mode == 'ok_noid': print(json.dumps({'status':'ok','summary':{'action':'created'}})); sys.exit(0)
+    if mode == 'ok_junkid': print(json.dumps({'status':'ok','summary':{'id':'zz!!not-hex'}})); sys.exit(0)
+    if mode == 'ok_numid': print(json.dumps({'status':'ok','summary':{'id':12345678}})); sys.exit(0)
+    if mode == 'ok_dashid': print(json.dumps({'status':'ok','summary':{'id':'a-------'}})); sys.exit(0)
+    if mode == 'ok_shortgrp': print(json.dumps({'status':'ok','summary':{'id':'abcdef01-0000-4'}})); sys.exit(0)
+    if mode == 'warn_numid': print(json.dumps({'status':'warn','summary':{'id':12345678},
+                          'errors':['parent (cause) cannot be resolved; stored independently']})); sys.exit(2)
+    if mode == 'warn_dashid': print(json.dumps({'status':'warn','summary':{'id':'a-------'},
+                          'errors':['parent (cause) cannot be resolved; stored independently']})); sys.exit(2)
+    if mode == 'warn_shortgrp': print(json.dumps({'status':'warn','summary':{'id':'abcdef01-0000-4'},
+                          'errors':['parent (cause) cannot be resolved; stored independently']})); sys.exit(2)
+    if mode == 'ok_uuid': print(json.dumps({'status':'ok','summary':{'action':'created',
+                          'id':'dddddddd-dddd-4ddd-8ddd-dddddddddddd'}})); sys.exit(0)
+    if mode == 'ok_hex32': print(json.dumps({'status':'ok','summary':{'action':'created',
+                          'id':'dddddddddddddddddddddddddddddddd'}})); sys.exit(0)
+    if mode == 'bad_summary': print(json.dumps({'status':'ok','summary':'boom'})); sys.exit(0)
+    if mode == 'skip_status': print(json.dumps({'status':'skip','summary':{}})); sys.exit(0)
+    if mode == 'slow_garbage': time.sleep(2.5); print('garbage not json'); sys.exit(0)
+    print(json.dumps({'status':'ok','summary':{'action':'created','id':'dddddddddddddddd'}}))
+elif sub == 'show':
+    if mode == 'show_fail':
+        print(json.dumps({'status':'fail','errors':['not found']}))
+        sys.exit(2)
+    title, content = 'stub', 'stub'
+    try:
+        for line in open(os.environ['TEST_CALLS'], encoding='utf-8').read().splitlines():
+            call = json.loads(line)
+            if call and call[0] == 'remember':
+                content, title = call[1], call[3]
+    except Exception:
+        pass
+    if mode == 'show_mismatch':
+        title = title + ' (drifted)'
+    if mode == 'show_wrongid':
+        print(json.dumps({'status':'ok','summary':{'id':'99999999-9999-4999-8999-999999999999','title':title},
+                          'details':{'entry':{'id':'99999999-9999-4999-8999-999999999999','title':title,'content':content}}}))
+        sys.exit(0)
+    if mode == 'show_tail' and content:
+        content = content[:40] + 'TAMPERED-TAIL'
+    print(json.dumps({'status':'ok','summary':{'id':sys.argv[2],'title':title},
+                      'details':{'entry':{'id':sys.argv[2],'title':title,'content':content}}}))
 elif sub == 'status':
     print(json.dumps({'status':'ok','summary':{'session':{'has_token':True,'user':'stub'},'local_total':42}}))
 elif sub == 'list':
-    ts = datetime.datetime.now(datetime.timezone.utc).isoformat() if mode == 'recent' else '2020-01-01T00:00:00Z'
-    print(json.dumps({'status':'fail'} if mode == 'failed' else {'status':'ok','details':[{'id':'record','updated_at':ts}]}))
+    ts = datetime.datetime.now(datetime.timezone.utc).isoformat() if list_mode == 'recent' else '2020-01-01T00:00:00Z'
+    if list_mode == 'list_schema':
+        print(json.dumps({'status':'ok','details':{'broken':True}}))
+    elif list_mode == 'list_notimes':
+        print(json.dumps({'status':'ok','details':[{'id':'record','no_dates':True}]}))
+    else:
+        print(json.dumps({'status':'fail'} if list_mode == 'failed' else {'status':'ok','details':[{'id':'record','updated_at':ts}]}))
 else: sys.exit(1)
 ''', encoding="utf-8")
         if os.name == 'nt':
@@ -101,31 +192,56 @@ else: sys.exit(1)
                         XDG_CACHE_HOME=str(self.case / 'cache'),
                         RESPITE_NUDGE_STATE=str(self.case / 'nudge'),
                         RESPITE_PENDING_NUDGE=str(self.case / 'pending'),
+                        RESPITE_TURN_STATE=str(self.case / 'turn-state'),
                         RESPITE_DATA=str(self.case / 'plugin-data'),
                         KIMI_PLUGIN_DATA=str(self.case / 'plugin-data'),
+                        TEST_CHILD_PID=str(self.case/'child.pid'), TEST_GRANDCHILD_PID=str(self.case/'grandchild.pid'),
+                        TEST_CLEANUP=str(self.case/'cleanup.pids'),
                         TEST_ENGINE=str(self.engine), TEST_CALLS=str(self.calls),
                         TEST_DENIED=str(self.denied), TEST_HOOK=str(ROOT / 'hooks/respire.py'),
                         PYTHONDONTWRITEBYTECODE='1', PYTHONUTF8='1')
 
-    def call(self, prompt='', event='UserPromptSubmit', mode='ok', active=False, every=1):
+    def call(self, prompt='', event='UserPromptSubmit', mode='ok', active=False, every=1,
+             session='s1', fast=False, extra_env=None, list_mode=None):
         self.config.write_text(json.dumps({'rsrs':str(self.engine), 'session_rules':True,
                                           'store_nudge_every':every}), encoding="utf-8")
         if event == 'Stop':
-            args = ['list','--limit','3','--json']
+            args_seq = []  # Stop must never invoke the CLI.
         elif event == 'SessionStart':
-            args = ['status','--json']
+            args_seq = [['status','--json']]
         elif prompt.startswith(('记：','store:')):
             content = prompt.replace('：',':',1).split(':',1)[1].strip()
-            args = ['remember',content,'--title',content,'--importance','important','--json']
+            argv = ['remember',content,'--title',content,'--importance','important','--json']
+            if mode in ('ok','show_fail','show_mismatch','show_wrongid','show_tail'):
+                args_seq = [argv, ['show','dddddddddddddddd','--json']]
+            elif mode in ('silent','ok_noid','ok_junkid','bad_summary',
+                          'ok_numid','ok_dashid','ok_shortgrp','warn_numid','warn_dashid','warn_shortgrp'):  # 未知回执 → 只读核实 list
+                args_seq = [argv, ['list','--limit','3','--json']]
+            elif mode == 'ok_uuid':
+                args_seq = [argv, ['show','dddddddd-dddd-4ddd-8ddd-dddddddddddd','--json']]
+            elif mode == 'ok_hex32':
+                args_seq = [argv, ['show','dddddddddddddddddddddddddddddddd','--json']]
+            elif mode == 'warn':
+                args_seq = [argv, ['show','eeeeeeeeeeeeeeee','--json']]
+            else:                    # pending / hang / skip_status / slow_garbage：不再有后续引擎调用
+                args_seq = [argv]
         else:
-            args = ['recall',prompt,'--limit','5','--titles','--json']
-        env = dict(self.env, TEST_EXPECTED_ARGV=json.dumps([str(self.engine)] + args),
+            args_seq = [['recall',prompt,'--limit','5','--titles','--json']]
+        env = dict(self.env, TEST_EXPECTED_ARGV=json.dumps([[str(self.engine)] + a for a in args_seq]),
                    TEST_EVENT=event, STUB_MODE=mode)
+        if fast:
+            env['RESPITE_TEST_FAST'] = '1'
+        if extra_env:
+            env.update(extra_env)
+        if list_mode is not None:
+            env['STUB_LIST'] = list_mode
+        payload = {'prompt':prompt,'hook_event_name':event,'stop_hook_active':active}
+        if session is not None:
+            payload['session_id'] = session
         result = subprocess.run([sys.executable, str(self.launcher)],
-                                input=json.dumps({'prompt':prompt,'hook_event_name':event,
-                                                  'stop_hook_active':active}), text=True,
+                                input=json.dumps(payload), text=True,
                                 encoding='utf-8', capture_output=True, env=env,
-                                cwd=self.case, timeout=20)
+                                cwd=self.case, timeout=40)
         self.assertFalse(self.denied.exists(), 'Isolation denied an external action')
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
@@ -190,7 +306,48 @@ else: sys.exit(1)
         out = self.call('store: durable fixture fact')
         self.assertIn('respire · stored', out)
         self.assertIn('retitle dddddddd', out)
-        self.assertEqual(self.recorded()[-1][0], 'remember')
+        self.assertIn('verified by read-back', out)
+        self.assertEqual([args[0] for args in self.recorded()], ['remember', 'show'])
+
+    def test_store_warn_is_written_not_refused(self):
+        out = self.call('store: durable fixture fact', mode='warn')
+        self.assertIn('Saved with warnings', out)
+        self.assertIn('parent (cause) cannot be resolved', out)
+        self.assertIn('retitle eeeeeeee', out)
+        self.assertNotIn('did not accept', out)
+        self.assertEqual([args[0] for args in self.recorded()], ['remember', 'show'])
+
+    def test_store_pending_relays_candidates_and_actions(self):
+        out = self.call('store: durable fixture fact', mode='pending')
+        self.assertIn('store pending', out)
+        self.assertIn('nothing was written', out)
+        self.assertIn('[aaaabbbb]', out)
+        self.assertIn('--merge-ids', out)
+        self.assertIn('--force', out)
+        self.assertEqual([args[0] for args in self.recorded()], ['remember'])
+
+    def test_store_readback_states(self):
+        self.assertIn('verified by read-back', self.call('store: durable fixture fact'))
+        self.assertIn('DIFFERENT id/title/content',
+                      self.call('store: durable fixture fact', mode='show_mismatch'))
+        self.assertIn('Read-back unavailable',
+                      self.call('store: durable fixture fact', mode='show_fail'))
+
+    def test_store_unknown_receipt_never_demands_resend(self):
+        out = self.call('store: durable fixture fact', mode='silent')
+        self.assertIn('store unknown', out)
+        self.assertIn('Do NOT resend', out)
+        self.assertIn('rsrs list --limit 3', out)
+        self.assertNotIn('did not accept', out)
+        self.assertEqual([args[0] for args in self.recorded()], ['remember', 'list'])
+
+    def test_store_timeout_is_unknown_and_makes_no_further_calls(self):
+        before = self.recorded()
+        out = self.call('store: durable fixture fact', mode='hang', fast=True)
+        self.assertIn('store unknown', out)
+        self.assertIn('timed out', out)
+        self.assertIn('Do NOT resend', out)
+        self.assertEqual(len(self.recorded()) - len(before), 1)
 
     def test_stop_deny_and_reentry_zero_calls(self):
         out = json.loads(self.call(event='Stop'))
@@ -201,30 +358,169 @@ else: sys.exit(1)
         self.assertEqual(self.recorded(), before)
         self.assertEqual((self.case / 'nudge').read_text(encoding="utf-8"), count)
 
-    def test_stop_every_three_and_disabled_zero_calls(self):
+    def test_stop_every_third_request_and_disabled_zero_calls(self):
         for number in range(1, 7):
-            out = self.call(event='Stop', every=3)
+            self.call(f'ordinary input {number}')          # 每轮都是新请求：重新武装收尾预算
+            raw = self.call(event='Stop', every=3)
             if number in (3, 6):
-                self.assertEqual(json.loads(out)['hookSpecificOutput']['permissionDecision'], 'deny')
+                self.assertEqual(json.loads(raw)['hookSpecificOutput']['permissionDecision'], 'deny')
             else:
-                self.assertEqual(out, '')
-        self.assertEqual(len(self.recorded()), 2)
+                self.assertEqual(raw, '')
+        self.assertEqual([a[0] for a in self.recorded()].count('list'), 0)
         before = self.recorded()
         self.assertEqual(self.call(event='Stop', every=0), '')
         self.assertEqual(self.recorded(), before)
         self.assertEqual((self.case / 'nudge').read_text(encoding="utf-8"), '6')
 
-    def test_stop_recent_stale_and_failed_query(self):
-        self.assertEqual(self.call(event='Stop', mode='recent'), '')
-        for mode in ('ok', 'failed'):
-            self.assertEqual(json.loads(self.call(event='Stop', mode=mode))
-                             ['hookSpecificOutput']['permissionDecision'], 'deny')
+    def test_stop_never_queries_engine(self):
+        # 复核整改：Stop 完全不再查询引擎——无归属的全库时间抑制已移除，也没有查库失败强迫续跑路径
+        for mode in ('ok', 'recent', 'failed', 'malformed'):
+            self.call(f'request before stop {mode}')
+            self.assertEqual(json.loads(self.call(event='Stop', mode=mode))['hookSpecificOutput']['permissionDecision'], 'deny', mode)
+        self.assertEqual([a[0] for a in self.recorded()].count('list'), 0)
 
+    def test_latch_is_per_session_and_permanent_until_new_prompt(self):
+        self.call('session A first request', session='A')
+        self.assertEqual(json.loads(self.call(event='Stop', session='A'))['hookSpecificOutput']['permissionDecision'], 'deny')
+        self.call('session B unrelated request', session='B')
+        self.assertEqual(json.loads(self.call(event='Stop', session='B'))['hookSpecificOutput']['permissionDecision'], 'deny')
+        self.assertEqual(self.call(event='Stop', session='A'), '')  # A 的锁不被 B 消耗
+        self.call('session A second request', session='A')
+        self.assertEqual(json.loads(self.call(event='Stop', session='A'))['hookSpecificOutput']['permissionDecision'], 'deny')
+
+    def test_receipt_edge_cases_are_unknown_not_failed(self):
+        for mode in ('ok_noid', 'ok_junkid', 'bad_summary'):
+            out = self.call('store: edge fact', mode=mode)
+            self.assertIn('store unknown', out, mode)
+            self.assertIn('Do NOT resend', out, mode)
+            self.assertNotIn('did not accept', out, mode)
+            self.assertNotIn('Saved', out, mode)
+        out = self.call('store: edge fact', mode='skip_status')
+        self.assertIn('not stored', out)
+        self.assertIn('never force a write', out)
+        self.assertNotIn('did not accept', out)
+
+    def test_malformed_ids_ok_and_warn_are_unknown_never_saved(self):
+        # 复审第三轮（P2）：畸形/非字符串 id 不是有效写入凭证——JSON 数字 12345678、
+        # 宽松字符类可过的 "a-------"、分组非法的 "abcdef01-0000-4"，在 ok 与 warn 双状态下
+        # 都必须归 unknown（只读核实、禁重发），绝不进入 Saved 分支、绝不 mark_store
+        for mode in ('ok_numid', 'ok_dashid', 'ok_shortgrp',
+                     'warn_numid', 'warn_dashid', 'warn_shortgrp'):
+            before = self.recorded()
+            out = self.call('store: malformed id fact', mode=mode)
+            self.assertIn('store unknown', out, mode)
+            self.assertIn('Do NOT resend', out, mode)
+            self.assertNotIn('Saved', out, mode)
+            self.assertNotIn('did not accept', out, mode)
+            # 不 mark_store 的引擎侧证据：无写后回读 show，只允许只读核实 list
+            self.assertEqual([a[0] for a in self.recorded()[len(before):]], ['remember', 'list'], mode)
+        # 不 mark_store 的凭证侧证据：随后 Stop 仍照常催存（免催凭证未登记）
+        self.call('store: malformed id fact', mode='ok_numid')
+        self.assertEqual(json.loads(self.call(event='Stop'))
+                         ['hookSpecificOutput']['permissionDecision'], 'deny')
+
+    def test_valid_uuid_and_hex32_ids_still_saved(self):
+        # 白名单正向确认：完整 UUID 与 32 位纯 hex 仍是有效 id——照常 Saved + 回读 verified
+        for mode in ('ok_uuid', 'ok_hex32'):
+            before = self.recorded()
+            out = self.call('store: strict valid id fact', mode=mode)
+            self.assertIn('Saved:', out, mode)
+            self.assertIn('verified by read-back', out, mode)
+            self.assertIn('retitle dddddddd', out, mode)
+            self.assertEqual([a[0] for a in self.recorded()[len(before):]], ['remember', 'show'], mode)
+        # A committed receipt is preserved, but it never suppresses the one Stop nudge.
+        out = self.call('store: strict valid id fact')
+        self.assertIn('Saved:', out)
+        self.assertEqual(json.loads(self.call(event='Stop'))['hookSpecificOutput']['permissionDecision'], 'deny')
+
+    def test_readback_full_verification(self):
+        out = self.call('store: full verify fact', mode='show_wrongid')
+        self.assertIn('Saved:', out)
+        self.assertIn('DIFFERENT', out)
+        self.assertNotIn('verified by read-back', out)
+        out = self.call('store: full verify fact tail', mode='show_tail')
+        self.assertIn('DIFFERENT', out)
+        self.assertNotIn('verified by read-back', out)
+        out = self.call('store: full verify fact ok')
+        self.assertIn('verified by read-back', out)
+
+    def test_slow_bad_receipt_respects_shared_budget(self):
+        before = self.recorded()
+        out = self.call('store: slow garbage fact', mode='slow_garbage',
+                        extra_env={'RESPITE_HOOK_BUDGET_S': '4'})
+        self.assertIn('store unknown', out)
+        self.assertIn('Do NOT resend', out)
+        self.assertEqual(len(self.recorded()) - len(before), 1)
+
+    def test_hanging_remember_is_clamped_to_total_budget(self):
+        import time
+        started = time.monotonic()
+        out = self.call('store: synthetic hanging write', mode='hang',
+                        extra_env={'RESPITE_HOOK_BUDGET_S': '4'})
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertIn('store unknown', out)
+        self.assertEqual([a[0] for a in self.recorded()], ['remember'])
+
+    def test_timeout_kills_wrapper_and_descendant_pipe_holders(self):
+        import time
+        started = time.monotonic()
+        out = self.call('store: synthetic tree timeout', mode='hang_tree',
+                        extra_env={'RESPITE_HOOK_BUDGET_S': '4'})
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertIn('store unknown', out)
+        for filename in ('child.pid', 'grandchild.pid'):
+            pid = int((self.case / filename).read_text(encoding='utf-8'))
+            if os.name == 'nt':
+                result = subprocess.run(['tasklist.exe', '/NH', '/FI', f'PID eq {pid}'],
+                                        capture_output=True, text=True, timeout=2)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotRegex(result.stdout, rf'\s{pid}\s')
+            else:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    continue
+                # Linux may retain an exited orphan as a zombie until init reaps it.
+                stat = Path(f'/proc/{pid}/stat')
+                self.assertTrue(stat.exists() and stat.read_text().split(') ', 1)[1].startswith('Z'),
+                                f'fixture descendant {pid} still running')
+        if os.name == 'nt':
+            self.assertTrue((self.case/'cleanup.pids').read_text(encoding='utf-8').strip())
+        self.assertEqual([a[0] for a in self.recorded()], ['remember'])
+
+    def test_verify_list_schema_failures_are_not_attribution(self):
+        for mode in ('list_schema', 'list_notimes'):
+            out = self.call('store: schema fact', mode='silent', list_mode=mode)
+            self.assertIn('store unknown', out, mode)
+            self.assertNotIn('may already be written', out, mode)
     def test_stop_after_hook_store_does_not_query_engine(self):
         self.call('store: durable fixture fact')
         before = self.recorded()
+        self.assertEqual(json.loads(self.call(event='Stop'))['hookSpecificOutput']['permissionDecision'], 'deny')
+        self.assertEqual(self.recorded(), before)
+
+    def test_turn_receipt_suppression_is_request_scoped(self):
+        self.call('store: durable fixture fact')
+        self.assertEqual(json.loads(self.call(event='Stop'))['hookSpecificOutput']['permissionDecision'], 'deny')
+        self.call('another ordinary input without storing')
+        self.assertEqual(json.loads(self.call(event='Stop'))
+                         ['hookSpecificOutput']['permissionDecision'], 'deny')
+
+    def test_stop_once_per_request_latch(self):
+        self.call('ordinary input')
+        self.assertEqual(json.loads(self.call(event='Stop'))
+                         ['hookSpecificOutput']['permissionDecision'], 'deny')
+        before = self.recorded()
         self.assertEqual(self.call(event='Stop'), '')
         self.assertEqual(self.recorded(), before)
+        self.call('fresh request after wrap-up')
+        self.assertEqual(json.loads(self.call(event='Stop'))
+                         ['hookSpecificOutput']['permissionDecision'], 'deny')
+
+    def test_receipt_suppression_is_session_scoped(self):
+        self.call('store: durable fixture fact', session='a')
+        self.assertEqual(json.loads(self.call(event='Stop', session='b'))
+                         ['hookSpecificOutput']['permissionDecision'], 'deny')
 
     def test_malformed_spy_cannot_pass_positive_control(self):
         self.positive_control()

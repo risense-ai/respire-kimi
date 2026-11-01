@@ -17,14 +17,19 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.1.2"
+VERSION = "0.1.6"
 
 # 超时窗（秒）：须盖住 rsrs runtime 冷启动（实测 doctor 模型加载 7s+），否则首轮静默、热后即灵
 RECALL_T = 14
 PROBE_T = 10
 STORE_T = 18
 LIST_T = 6    # Stop 查「最近一条落库时间」的窗口（实测 list ~0.9s，热后即回）
+SHOW_T = 8    # 写后回读（show）窗口；实际用时按 hook 预算自适应收缩
 LOG_MAX = 256 * 1024  # hook.log 超此整文件清轮
+
+if os.environ.get("RESPITE_TEST_FAST") == "1":   # 测试后门：把全部超时压到秒级（同族 RESPITE_FAKE_*）
+    RECALL_T = PROBE_T = STORE_T = SHOW_T = 2
+    LIST_T = 1
 
 DEFAULTS = {
     "rsrs": "",                 # respire 引擎（rsrs）路径；空 = 自动探测
@@ -175,10 +180,53 @@ def find_rsrs(cfg: dict):
     return None
 
 
-def run_rsrs(bin_path: str, args: list, timeout: int):
-    # rsrs 的 --json 模式下进度写 stderr，capture 须分离，只解析 stdout
-    return subprocess.run([bin_path] + args, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=timeout)
+def _kill_cli_tree(child):
+    """Terminate only this invocation's tree, with bounded cleanup and no output capture."""
+    if os.name == "nt":
+        # Killing cmd.exe alone leaves its Python/CLI child holding stdout open.
+        taskkill = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
+        try:
+            subprocess.run([taskkill, "/PID", str(child.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=1, check=False)
+        except Exception:
+            pass
+    else:
+        import signal
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if child.poll() is None:
+        child.kill()
+
+
+def run_rsrs(bin_path: str, args: list, timeout: float):
+    # A dedicated POSIX group or Windows /T cleanup owns descendants as well as wrappers.
+    child = subprocess.Popen([bin_path] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, encoding="utf-8", errors="replace",
+                             start_new_session=os.name != "nt")
+    try:
+        stdout, stderr = child.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_cli_tree(child)
+        try:
+            child.communicate(timeout=0.4)
+        except subprocess.TimeoutExpired:
+            # Never repeat communicate() without a deadline: a failed tree kill must
+            # not turn a timed-out write into an indefinitely blocked hook.
+            if child.poll() is None:
+                child.kill()
+            try:
+                child.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                pass
+        # TimeoutExpired includes the entire command/prompt; expose only a fixed cause.
+        raise TimeoutError("engine deadline exceeded") from None
+    except BaseException:
+        _kill_cli_tree(child)
+        raise
+    return subprocess.CompletedProcess([bin_path] + args, child.returncode, stdout, stderr)
 
 
 def extract_title(content: str) -> str:
@@ -198,47 +246,297 @@ def extract_title(content: str) -> str:
     return head                                       # 无标点长串才落到 70 字上界
 
 
-def do_store(bin_path: str, content: str, cfg: dict) -> str:
-    """显式落库：判后即存三态——ok 直写 / pending 给候选待决 / 其余为失败，皆回执不静默。"""
+TURN_FRESH_S = 1800  # 本轮写回执的新鲜度上限：超窗视为陈旧，不再据此免催
+# 一次收尾锁（复核整改）：每会话独立锁文件，O_CREAT|O_EXCL 原子独占——并发 Stop 只有一个能落锁；
+# 锁不设 TTL：只有新的真实请求（mark_prompt）会删除它重新武装；无法落锁（目录不可写等）一律放行，
+# 绝不在没有锁保护的情况下 block。写回执/时刻存于尽力维护的 per-session map（temp+rename 原子替换），
+# map 仅作诊断，不参与 Stop 决策；失败或旧快照回滚均不影响一次锁。
+
+
+def _turn_dir():
+    base = os.environ.get("RESPITE_TURN_STATE") or data_dir()
+    if base.endswith(".json") or base.endswith(".store_turn"):
+        base = os.path.dirname(base)  # 兼容旧文件路径用法：取目录
+    try:
+        os.makedirs(base, exist_ok=True)
+        return base
+    except Exception:
+        return None
+
+
+def _sid_key(session: str) -> str:
+    import hashlib
+    return hashlib.sha1(("respire-turn-v2:" + (session or "~")).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _latch_path(session: str):
+    d = _turn_dir()
+    return os.path.join(d, ".latch_" + _sid_key(session)) if d else None
+
+
+def _map_path():
+    d = _turn_dir()
+    return os.path.join(d, "turn_map.json") if d else None
+
+
+def _map_load() -> dict:
+    try:
+        with open(_map_path(), encoding="utf-8") as f:
+            m = json.load(f)
+        return m if isinstance(m, dict) else {}
+    except Exception:
+        return {}
+
+
+def _map_update(session: str, patch: dict) -> bool:
+    """合并更新单会话条目（temp+rename 原子替换）；失败返回 False，绝不抛。"""
+    p = _map_path()
+    if not p or not session:
+        return False
+    try:
+        m = _map_load()
+        entry = m.get(session) if isinstance(m.get(session), dict) else {}
+        entry.update(patch)
+        m[session] = entry
+        if len(m) > 64:  # 只按数量收敛陈旧会话，不按时间让锁/凭证失效
+            for k in sorted(m, key=lambda k: float(m[k].get("prompt_ts") or 0))[:len(m) - 64]:
+                m.pop(k, None)
+        tmp = "%s.%d.tmp" % (p, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(m, f)
+        os.replace(tmp, p)
+        return True
+    except Exception:
+        return False
+
+
+def latch_claim(session: str) -> bool:
+    """原子一次收尾锁：独占创建成功=True（本次可 block）；已存在/任何失败=False（放行方向）。"""
+    p = _latch_path(session)
+    if not p:
+        return False
+    try:
+        fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, json.dumps({"ts": time.time()}).encode("utf-8"))
+        os.close(fd)
+        return True
+    except Exception:
+        return False  # FileExistsError=已催过；其余失败=无锁不 block
+
+
+def latch_rearm(session: str) -> None:
+    """新真实请求重新武装：删除本会话锁。删不掉时保持上锁（宁可少催，不重复催）。"""
+    p = _latch_path(session)
+    if not p:
+        return
+    try:
+        os.remove(p)
+    except Exception:
+        pass
+
+
+def mark_prompt(session: str):
+    """真实用户请求开始：尽力记录 prompt_ts；删除一次收尾锁（重新武装）。"""
+    _map_update(session, {"prompt_ts": time.time()})
+    latch_rearm(session)
+
+
+def mark_store(session: str):
+    """本层「记：」成功回执（ok/warn + 有效 id）：尽力记录诊断时刻，不作为 Stop 免催凭证。"""
+    _map_update(session, {"store_ts": time.time()})
+
+
+def turn_stored(session: str) -> bool:
+    """Receipt snapshots are diagnostic only; Stop never trusts them to skip its one nudge."""
+    return False
+
+
+def readback(bin_path: str, sid: str, title: str, content: str, cfg: dict, budget_s: float):
+    """Verify native-string identity, title and full body; bad reads never erase a write receipt."""
+    started = time.monotonic()
+    def finish(verdict):
+        log_event(cfg, "readback", verdict, "", (time.monotonic() - started) * 1000)
+        return verdict
+    if budget_s < 2:
+        return finish("unavailable")
+    try:
+        r = run_rsrs(bin_path, ["show", sid, "--json"], min(SHOW_T, budget_s))
+        doc = json.loads(r.stdout) if r.stdout else {}
+        if not isinstance(doc, dict) or doc.get("status") != "ok":
+            return finish("unavailable")
+        details = doc.get("details")
+        entry = details.get("entry") if isinstance(details, dict) else None
+        if not isinstance(entry, dict):
+            return finish("unavailable")
+        summary = doc.get("summary")
+        rid = summary.get("id") if isinstance(summary, dict) else None
+        eid = entry.get("id")
+        if not (isinstance(rid, str) and rid == sid and isinstance(eid, str) and eid == sid):
+            return finish("mismatch")
+        et, ec = entry.get("title"), entry.get("content")
+        if not isinstance(et, str) or not isinstance(ec, str):
+            return finish("mismatch")
+        return finish("verified" if et == title and ec.strip() == content.strip() else "mismatch")
+    except Exception:
+        # remember already committed: retain Saved, never retry on a malformed read.
+        return finish("unavailable")
+
+
+def verify_recent_write(bin_path: str, t0: float, max_wait: float = 0):
+    """未知写结果的只读核实（R10）：list 近 3 条里是否有 t0 之后落库的条目。返回 (id, title) 或 None。
+    max_wait>0 时受剩余 hook 预算约束（超时上限取 min(LIST_T, max_wait)）。"""
+    try:
+        timeout = LIST_T
+        if max_wait > 0:
+            timeout = max(1, min(LIST_T, int(max_wait)))
+        d, ok = _last_store_detail(bin_path, timeout)
+    except Exception:
+        return None
+    if not ok or not isinstance(d, dict):
+        return None
+    ts = None
+    for k in ("updated_at", "created_at"):
+        v = _epoch(d.get(k))
+        if v is not None and (ts is None or v > ts):
+            ts = v
+    if ts is None or ts < t0 - 0.05:  # 引擎时间戳毫秒截断留 50ms 容差；更早的写入不归属本次
+        return None
+    return str(d.get("id") or ""), str(d.get("title") or "")
+
+
+def do_store(bin_path: str, content: str, cfg: dict, session: str = "") -> str:
+    """显式落库回执状态机（对齐 CLI 信封语义，审计报告 §7.1/§7.2）：
+      ok + summary.id   → 已写入：show 回读核验后回执（verified/mismatch/unavailable 如实标注）
+      warn + summary.id → 已写入但有警告（parent 未解析 / post-remember hook 告警）——
+                          绝不当失败、绝不引导重发；附 errors 摘要并回读
+      pending           → 未写入：转述候选（items 带短 id）＋引擎建议动作（改＞并＞挂＞存）
+      超时/中止          → 结果未知：不再发引擎调用（预算已耗尽）；回执只允许只读核实
+      坏信封/无输出      → 结果未知：先只读查库（list 近 3 条），禁止自动重写
+      其余明确拒绝态     → fail：转述 errors，不自动重试
+    """
     if not content:
         log_event(cfg, "store", "empty_content")
         return ""
     title = extract_title(content) or "respire 快存"
-    t0 = time.time()
+    t0 = time.time()  # wall clock only for read-only timestamp hints
+    mono0 = time.monotonic()
+    try:
+        budget = float(os.environ.get("RESPITE_HOOK_BUDGET_S") or 20)
+    except ValueError:
+        budget = 20.0
+    if not (0 < budget < float("inf")):
+        budget = 20.0
+    deadline = mono0 + budget - 2.5
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return "【respire · not stored】No write was sent: hook budget exhausted."
+    r = None
     try:
         r = run_rsrs(bin_path, ["remember", content, "--title", title,
-                                "--importance", "important", "--json"], STORE_T)
+                                "--importance", "important", "--json"], min(STORE_T, remaining))
     except Exception as e:
         log_event(cfg, "store", "timeout_or_error", f"{type(e).__name__}: {e}", (time.time() - t0) * 1000)
-        return "【respire · store】respire timed out; run rsrs remember manually to verify whether it was written."
     ms = (time.time() - t0) * 1000
-    try:
-        doc = json.loads(r.stdout) if r.stdout else {}
-    except Exception:
-        doc = {}
+    doc, parse_ok = {}, False
+    if r is not None and r.stdout and r.stdout.strip():
+        try:
+            doc = json.loads(r.stdout)
+            parse_ok = True
+        except Exception:
+            doc, parse_ok = {}, False
     if not isinstance(doc, dict):
         doc = {}
     status = str(doc.get("status") or "")
-    if status == "ok":
-        sid = str((doc.get("summary") or {}).get("id") or "")
-        log_event(cfg, "store", "ok", sid[:8], ms)
-        tail = f" ({sid[:8]})" if sid else ""
-        return (f"【respire · stored】Saved: {title}{tail}. The title is a rule-based provisional one — "
-                "extract a complete \"subject + action + result\" fact sentence from the content and "
-                f"replace it with rsrs retitle {sid[:8]} --title (title is the facade for recall and dedup).")
-    if status == "pending":
-        # 判后即存判定疑似重复/可挂靠，未写入（written:false）——转述候选，模型接续决断
+    summ = doc.get("summary")
+    raw_id = summ.get("id") if isinstance(summ, dict) else None
+    # 严格类型+白名单（复审第三轮 P2）：id 必须原生字符串（JSON 数字 12345678 不强转），
+    # 且为完整 UUID 或 16+ 位纯 hex（"a-------"/"abcdef01-0000-4" 拒绝）——
+    # 缺失/畸形 id 一律按不可确认处理（unknown），不当有效写入凭证也不当失败
+    sid = raw_id if isinstance(raw_id, str) and re.fullmatch(
+        r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{16,}", raw_id, re.I) else ""
+
+    # —— 已写入：ok / warn（warn 也是已提交，只是带警告）——
+    if parse_ok and sid and status in ("ok", "warn"):
+        mark_store(session)
+        if status == "warn":
+            warns = [str(e) for e in (doc.get("errors") if isinstance(doc.get("errors"), list) else [])
+                     if isinstance(e, (str, int, float))][:3]
+            out = "【respire · stored】Saved with warnings"
+            if warns:
+                out += " (" + "; ".join(warns)[:160] + ")"
+            out += f": {title} ({sid[:8]})."
+            log_event(cfg, "store", "warn_written", f"{sid[:8]} warn={len(warns)}", ms)
+        else:
+            out = f"【respire · stored】Saved: {title} ({sid[:8]})."
+            log_event(cfg, "store", "ok", sid[:8], ms)
+        rb = readback(bin_path, sid, title, content, cfg,
+                      deadline - time.monotonic())
+        if rb == "verified":
+            out += " Write verified by read-back (entry exists; id, title and full content match)."
+        elif rb == "mismatch":
+            out += (" Read-back shows a DIFFERENT id/title/content than sent — inspect rsrs show "
+                    f"{sid[:8]} before any retitle.")
+        else:
+            out += f" Read-back unavailable — if it matters, verify with rsrs show {sid[:8]}."
+        out += (" The title is a rule-based provisional one — extract a complete \"subject + action + result\" "
+                "fact sentence from the content and replace it with rsrs retitle "
+                f"{sid[:8]} --title (title is the facade for recall and dedup).")
+        return out
+
+    # —— 未写入：pending 候选（含 pre-remember veto 等一切 pending 态）——
+    if parse_ok and status == "pending":
         log_event(cfg, "store", "pending", f"cand={len(doc.get('items') or [])}", ms)
-        lines = ["【respire · store pending】respire judged this item similar to existing memory; nothing was written. Candidates:"]
+        lines = ["【respire · store pending】respire judged this item similar to existing memory (or a hook vetoed it); "
+                 "nothing was written. Candidates (read bodies with rsrs show <short-id> before deciding):"]
         for it in (doc.get("items") or [])[:5]:
             if isinstance(it, dict):
-                lines.append(f"- [{it.get('name', '?')}] {it.get('value', '')}")
-        lines.append("Decide: to attach, rerun rsrs remember with the same text --parent <id>; if it is genuinely independent, add --force to write it directly.")
+                act = f" — suggested: {it['action']}" if it.get("action") else ""
+                lines.append(f"- [{it.get('name', '?')}] {it.get('value', '')}{act}")
+        acts = [str(a) for a in (doc.get("actions") or []) if isinstance(a, str) and a.strip()][:6]
+        if acts:
+            lines.append("Engine-suggested next actions (prefer merge > attach > new; decide from candidate bodies, never blind-force):")
+            lines.extend(f"  {a}" for a in acts)
+        else:
+            lines.append("Decide: read the candidates above, then merge/attach with the suggested ids, "
+                         "or add --force only if genuinely independent.")
         return "\n".join(lines)
-    errs = doc.get("errors") or []
-    msg = json.dumps(errs, ensure_ascii=False)[:200] if errs else f"status={status or r.returncode}"
-    log_event(cfg, "store", "fail", msg, ms)
-    return f"【respire · store failed】respire did not accept it: {msg}"
+
+    # —— 引擎按当前模式拒绝执行（skip：readonly/paused 等，未写也不是失败）——
+    if parse_ok and status == "skip":
+        log_event(cfg, "store", "skip_mode", "", ms)
+        return ("【respire · not stored】The engine skipped the operation (read-only or paused mode); "
+                "follow engine policy and never force a write.")
+    # —— 明确拒绝（白名单：仅 fail 断言未接受）——
+    if parse_ok and status == "fail":
+        errs = doc.get("errors") if isinstance(doc.get("errors"), list) else []
+        msg = json.dumps(errs, ensure_ascii=False)[:200] if errs else f"status=fail rc={r.returncode}"
+        log_event(cfg, "store", "fail", msg, ms)
+        return f"【respire · store failed】respire did not accept it: {msg}"
+
+    # —— 结果未知：坏信封/无输出（engine 秒回）→ 剩余预算足够才只读查库 ——
+    if r is not None:
+        budget_s = deadline - time.monotonic()
+        hit = None
+        if budget_s >= 1.5:
+            try:
+                hit = verify_recent_write(bin_path, t0, budget_s)
+            except Exception:
+                hit = None
+        if hit:
+            hid, htitle = hit
+            log_event(cfg, "store", "unknown_maybe_written", hid[:8], (time.time() - t0) * 1000)
+            return ("【respire · store unknown】The write result is unknown (unreadable receipt), and a fresh entry "
+                    f"appeared in the store — it may already be written: [{hid[:8]}] {htitle}. Verify read-only with "
+                    f"rsrs show {hid[:8]}; do NOT resend rsrs remember for the same fact.")
+        log_event(cfg, "store", "unknown", f"parse={parse_ok} rc={r.returncode}", ms)
+        return ("【respire · store unknown】The write result is unknown (engine returned an unreadable receipt). "
+                "Verify read-only: rsrs list --limit 3 --json, then rsrs show <id>. Do NOT resend rsrs remember "
+                "for the same fact — resending can duplicate an already-committed write.")
+    # —— 超时/中止（预算已耗尽，不再发引擎调用）——
+    log_event(cfg, "store", "unknown_timeout", "", ms)
+    return ("【respire · store unknown】The write result is unknown (engine timed out). Verify read-only: "
+            "rsrs list --limit 3 --json, then rsrs show <id>. Do NOT resend rsrs remember for the same fact — "
+            "resending can duplicate an already-committed write.")
 
 
 def do_recall(bin_path: str, prompt: str, cfg: dict) -> str:
@@ -427,26 +725,50 @@ def _epoch(rfc3339):
     return dt.timestamp()
 
 
-def engine_last_store(engine, timeout: int = LIST_T):
-    """问引擎最近一条记录的落库时间（秒级 epoch），取 top3 的 updated/created 最大值。
-    agent 直接跑 rsrs remember 不写本层 hook.log，节流必须问库才看得见。失败返回 None（放行给上层催）。"""
-    r = run_rsrs(engine, ["list", "--limit", "3", "--json"], timeout)
-    doc = json.loads(r.stdout) if r.stdout else None
-    dets = doc.get("details") if isinstance(doc, dict) else None
-    best = None
-    for d in (dets or []):
+def _last_store_detail(engine, timeout: int = LIST_T):
+    """问引擎最近一条记录（list 近 3 条取 updated/created 最新者）。
+    返回 (detail|None, query_ok)：query_ok=False = 查询失败/超时/坏信封——
+    调用方必须放行（fail-open），不得据「查不到」催存。"""
+    try:
+        r = run_rsrs(engine, ["list", "--limit", "3", "--json"], timeout)
+    except Exception:
+        return None, False
+    try:
+        doc = json.loads(r.stdout) if r.stdout else None
+    except Exception:
+        return None, False
+    if not isinstance(doc, dict) or doc.get("status") != "ok":
+        return None, False
+    details = doc.get("details")
+    if not isinstance(details, list):
+        return None, False  # 坏信封（details 非数组）按查询失败处理 → 不归属
+    best, best_ts, any_ts = None, None, False
+    for d in details:
         if not isinstance(d, dict):
             continue
+        ts = None
         for k in ("updated_at", "created_at"):
             v = _epoch(d.get(k))
-            if v is not None and (best is None or v > best):
-                best = v
-    return best
+            if v is not None and (ts is None or v > ts):
+                ts = v
+        if ts is not None:
+            any_ts = True
+            if best_ts is None or ts > best_ts:
+                best, best_ts = d, ts
+    if details and not any_ts:
+        return None, False  # 非空却无可解析时间戳：schema 异常 → 查询失败
+    return best, True  # 合法空库（details:[]）：查询成功、无近期写入
 
 
 def on_stop(data: dict, cfg: dict, engine) -> str:
     """Stop 存储检查：干完活的存储提示（deny 续跑一轮，Kimi 协议为 hookSpecificOutput JSON）。
-    规范防循环：续跑轮 stdin 带 stop_hook_active=true → 放行。"""
+    规范防循环：续跑轮 stdin 带 stop_hook_active=true → 放行。
+    审计整改后的免催/放行契约（DM-01/DM-03/DM-04）：
+      - 查库失败/超时/坏信封 → 放行（fail-open：记忆层故障不得拦主任务）
+      - 本轮已有成功写回执（同会话、prompt 之后）→ 放行
+      - 引擎侧写入晚于本轮 prompt（同会话；agent 自行 rsrs remember）→ 放行
+      - 每个真实请求至多 block 一次（stop_hook_active ＋ 本层一次收尾锁双保险）
+      - 缺会话/轮次凭证时不免催（宁可多一轮有界收尾，不做跨轮误抑制）"""
     if data.get("stop_hook_active") is True:
         log_event(cfg, "stop", "active_skip")
         return ""
@@ -472,37 +794,13 @@ def on_stop(data: dict, cfg: dict, engine) -> str:
             return ""
     except Exception:
         pass
-    now = time.time()
-    try:  # 近 10 分钟本层已落库过 → 不再催（记忆活跃）：钩子侧「记：」路径写本层日志
-        logp = os.environ.get("RESPITE_LOG") or os.path.join(data_dir(), "hook.log")
-        if os.path.exists(logp):
-            with open(logp, encoding="utf-8", errors="replace") as f:
-                for ln in f.readlines()[-50:]:
-                    try:
-                        r = json.loads(ln)
-                    except Exception:
-                        continue
-                    if r.get("ev") == "store" and r.get("out") == "ok":
-                        try:
-                            ts = time.mktime(time.strptime(r.get("ts", ""), "%Y-%m-%dT%H:%M:%S"))
-                        except Exception:
-                            continue
-                        if now - ts < 600:
-                            log_event(cfg, "stop", "stored_recent_skip", "src=hooklog")
-                            return ""
-    except Exception:
-        pass
-    try:  # 近 10 分钟引擎侧有落库（agent 直接 rsrs remember/update）→ 同样不催，问库而非看日志
-        if engine:
-            t1 = time.time()
-            ts = engine_last_store(engine)
-            if ts is not None and now - ts < 600:
-                log_event(cfg, "stop", "stored_recent_skip", "src=engine", (time.time() - t1) * 1000)
-                return ""
-    except Exception:
-        pass
+    session = str(data.get("session_id") or "")
+    # 一次收尾锁：O_EXCL 原子独占；无法落锁（含目录不可写）一律放行——绝不无锁 block
+    if not latch_claim(session):
+        log_event(cfg, "stop", "once_latch_skip")
+        return ""
+    # Stop does not consume the diagnostic receipt map or global engine timestamps.
     log_event(cfg, "stop", "nudge")
-    # Kimi 阻断协议：stdout 打 hookSpecificOutput JSON（permissionDecision deny + reason），exit 0
     return json.dumps({"hookSpecificOutput": {"permissionDecision": "deny",
                                               "permissionDecisionReason": STORE_NUDGE}},
                       ensure_ascii=False)
@@ -514,17 +812,25 @@ def on_prompt(data: dict, cfg: dict, engine) -> str:
         log_event(cfg, "prompt", "bad_prompt", "非字符串")
         return ""
     prompt = prompt.strip()
-    nudge = take_pending_nudge()   # SessionStart 挂起引导置顶带出（Kimi SessionStart 输出不进上下文）
-    if not prompt or SKIP_PREFIX.match(prompt):
+    nudge = ""  # Only a real prompt may consume deferred SessionStart guidance.
+    if not prompt:
+        log_event(cfg, "prompt", "nomem_or_empty", prompt[:40])
+        return nudge
+    session = str(data.get("session_id") or "")
+    if SKIP_PREFIX.match(prompt):
+        nudge = take_pending_nudge()
+        mark_prompt(session)  # A real /nomem request skips recall, not request registration.
         log_event(cfg, "prompt", "nomem_or_empty", prompt[:40])
         return nudge
     for pat in (cfg.get("skip_prefixes") or []):   # 宿主内部提示白名单：不召回不落库
         if isinstance(pat, str) and pat and prompt[:len(pat)].lower() == pat.lower():
             log_event(cfg, "prompt", "internal_skip", pat)
             return nudge
+    nudge = take_pending_nudge()
+    mark_prompt(session)  # Internal prompts above never rearm the one-shot latch.
     if contains_secret(prompt):
-        # 只记固定原因码，不落命中摘要：摘要可能含凭据明文，而 redact 不覆盖
-        # api_key/token/secret 普通赋值与 Bearer 值，落摘要即泄漏。
+        # 只记固定原因码：redact 不覆盖 api_key/token/secret 普通赋值与 Bearer 值，
+        # 落任何输入摘要都可能把凭据带进日志——凭据轮日志零内容
         log_event(cfg, "prompt", "secret_skip")
         return nudge + "\n" + SECRET_SKIP if nudge else SECRET_SKIP
     m = SLASH_PREFIX.match(prompt)                 # 剥斜杠命令 token（/skill:…、/respire:…），防污染召回 query
@@ -539,7 +845,7 @@ def on_prompt(data: dict, cfg: dict, engine) -> str:
         if not engine:
             log_event(cfg, "store", "engine_missing", prompt[:40])
             return _prepend(nudge, NO_RSRS)
-        return _prepend(nudge, do_store(engine, rest, cfg))
+        return _prepend(nudge, do_store(engine, rest, cfg, session))
     if len(prompt) < int(cfg["min_prompt_chars"]):
         log_event(cfg, "prompt", "too_short", prompt[:40])
         return nudge
