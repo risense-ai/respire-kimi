@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.5 — 2026-11-01 · 复审第三轮（P2）：id 白名单严格化
+
+### Fixed
+
+- **畸形/非字符串 id 不再被当有效写入凭证（复审第三轮 P2）**：旧校验先把 `summary.id` 强转 `str` 再匹配宽松字符类 `[0-9a-fA-F][0-9a-fA-F-]{7,}`，导致 JSON 数字 `12345678`、`"a-------"`、`"abcdef01-0000-4"` 等非法值也能进入 ok/warn 的 Saved 分支并 `mark_store`（即使回读不可用仍保留 Saved、可令 Stop 免催）。改为**严格类型＋白名单**（zcode/dimcode 终案同款）：id 必须为原生字符串（数字不 `str()` 强转），且 `re.fullmatch` 完整 UUID（8-4-4-4-12）或 16+ 位纯 hex——不匹配一律 `sid=""` 归 **unknown**（只读核实、禁重发、不 mark_store），与缺 id/坏 summary 同路径。
+
+### Changed
+
+- 测试：CI 40/40（+复审三类反例 `ok_numid`/`ok_dashid`/`ok_shortgrp` 的 ok/warn 双状态完整 hook 测试：断言 unknown 回执＋Do NOT resend＋不含 Saved＋调用序列仅 remember→list（无写后回读 show）＋随后 Stop 仍催存（mark_store 未登记）；正向确认补完整 UUID 与 32 位 hex 两档合法 id 仍 Saved＋回读 verified＋Stop 免催）。README「记：」行同步 id 白名单口径。
+
 ## 0.1.4 — 2026-11-01 · 维护者复审整改（5 项＋回读附注）
 
 ### Fixed

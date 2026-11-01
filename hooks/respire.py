@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 
 # 超时窗（秒）：须盖住 rsrs runtime 冷启动（实测 doctor 模型加载 7s+），否则首轮静默、热后即灵
 RECALL_T = 14
@@ -407,9 +407,12 @@ def do_store(bin_path: str, content: str, cfg: dict, session: str = "") -> str:
         doc = {}
     status = str(doc.get("status") or "")
     summ = doc.get("summary")
-    sid = str(summ.get("id") or "") if isinstance(summ, dict) else ""
-    if not re.fullmatch(r"[0-9a-fA-F][0-9a-fA-F-]{7,}", sid):
-        sid = ""  # 缺失/畸形 id 一律按不可确认处理，不当有效也不当失败
+    raw_id = summ.get("id") if isinstance(summ, dict) else None
+    # 严格类型+白名单（复审第三轮 P2）：id 必须原生字符串（JSON 数字 12345678 不强转），
+    # 且为完整 UUID 或 16+ 位纯 hex（"a-------"/"abcdef01-0000-4" 拒绝）——
+    # 缺失/畸形 id 一律按不可确认处理（unknown），不当有效写入凭证也不当失败
+    sid = raw_id if isinstance(raw_id, str) and re.fullmatch(
+        r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{16,}", raw_id, re.I) else ""
 
     # —— 已写入：ok / warn（warn 也是已提交，只是带警告）——
     if parse_ok and sid and status in ("ok", "warn"):

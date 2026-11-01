@@ -99,6 +99,19 @@ elif sub == 'remember':
     if mode == 'silent': sys.exit(0)
     if mode == 'ok_noid': print(json.dumps({'status':'ok','summary':{'action':'created'}})); sys.exit(0)
     if mode == 'ok_junkid': print(json.dumps({'status':'ok','summary':{'id':'zz!!not-hex'}})); sys.exit(0)
+    if mode == 'ok_numid': print(json.dumps({'status':'ok','summary':{'id':12345678}})); sys.exit(0)
+    if mode == 'ok_dashid': print(json.dumps({'status':'ok','summary':{'id':'a-------'}})); sys.exit(0)
+    if mode == 'ok_shortgrp': print(json.dumps({'status':'ok','summary':{'id':'abcdef01-0000-4'}})); sys.exit(0)
+    if mode == 'warn_numid': print(json.dumps({'status':'warn','summary':{'id':12345678},
+                          'errors':['parent (cause) cannot be resolved; stored independently']})); sys.exit(2)
+    if mode == 'warn_dashid': print(json.dumps({'status':'warn','summary':{'id':'a-------'},
+                          'errors':['parent (cause) cannot be resolved; stored independently']})); sys.exit(2)
+    if mode == 'warn_shortgrp': print(json.dumps({'status':'warn','summary':{'id':'abcdef01-0000-4'},
+                          'errors':['parent (cause) cannot be resolved; stored independently']})); sys.exit(2)
+    if mode == 'ok_uuid': print(json.dumps({'status':'ok','summary':{'action':'created',
+                          'id':'dddddddd-dddd-4ddd-8ddd-dddddddddddd'}})); sys.exit(0)
+    if mode == 'ok_hex32': print(json.dumps({'status':'ok','summary':{'action':'created',
+                          'id':'dddddddddddddddddddddddddddddddd'}})); sys.exit(0)
     if mode == 'bad_summary': print(json.dumps({'status':'ok','summary':'boom'})); sys.exit(0)
     if mode == 'skip_status': print(json.dumps({'status':'skip','summary':{}})); sys.exit(0)
     if mode == 'slow_garbage': time.sleep(2.5); print('garbage not json'); sys.exit(0)
@@ -177,10 +190,15 @@ else: sys.exit(1)
             argv = ['remember',content,'--title',content,'--importance','important','--json']
             if mode in ('ok','show_fail','show_mismatch','show_wrongid','show_tail'):
                 args_seq = [argv, ['show','dddddddddddddddd','--json']]
+            elif mode in ('silent','ok_noid','ok_junkid','bad_summary',
+                          'ok_numid','ok_dashid','ok_shortgrp','warn_numid','warn_dashid','warn_shortgrp'):  # 未知回执 → 只读核实 list
+                args_seq = [argv, ['list','--limit','3','--json']]
+            elif mode == 'ok_uuid':
+                args_seq = [argv, ['show','dddddddd-dddd-4ddd-8ddd-dddddddddddd','--json']]
+            elif mode == 'ok_hex32':
+                args_seq = [argv, ['show','dddddddddddddddddddddddddddddddd','--json']]
             elif mode == 'warn':
                 args_seq = [argv, ['show','eeeeeeeeeeeeeeee','--json']]
-            elif mode in ('silent','ok_noid','ok_junkid','bad_summary'):  # 未知回执 → 只读核实 list
-                args_seq = [argv, ['list','--limit','3','--json']]
             else:                    # pending / hang / skip_status / slow_garbage：不再有后续引擎调用
                 args_seq = [argv]
         else:
@@ -357,6 +375,39 @@ else: sys.exit(1)
         self.assertIn('not stored', out)
         self.assertIn('never force a write', out)
         self.assertNotIn('did not accept', out)
+
+    def test_malformed_ids_ok_and_warn_are_unknown_never_saved(self):
+        # 复审第三轮（P2）：畸形/非字符串 id 不是有效写入凭证——JSON 数字 12345678、
+        # 宽松字符类可过的 "a-------"、分组非法的 "abcdef01-0000-4"，在 ok 与 warn 双状态下
+        # 都必须归 unknown（只读核实、禁重发），绝不进入 Saved 分支、绝不 mark_store
+        for mode in ('ok_numid', 'ok_dashid', 'ok_shortgrp',
+                     'warn_numid', 'warn_dashid', 'warn_shortgrp'):
+            before = self.recorded()
+            out = self.call('store: malformed id fact', mode=mode)
+            self.assertIn('store unknown', out, mode)
+            self.assertIn('Do NOT resend', out, mode)
+            self.assertNotIn('Saved', out, mode)
+            self.assertNotIn('did not accept', out, mode)
+            # 不 mark_store 的引擎侧证据：无写后回读 show，只允许只读核实 list
+            self.assertEqual([a[0] for a in self.recorded()[len(before):]], ['remember', 'list'], mode)
+        # 不 mark_store 的凭证侧证据：随后 Stop 仍照常催存（免催凭证未登记）
+        self.call('store: malformed id fact', mode='ok_numid')
+        self.assertEqual(json.loads(self.call(event='Stop'))
+                         ['hookSpecificOutput']['permissionDecision'], 'deny')
+
+    def test_valid_uuid_and_hex32_ids_still_saved(self):
+        # 白名单正向确认：完整 UUID 与 32 位纯 hex 仍是有效 id——照常 Saved + 回读 verified
+        for mode in ('ok_uuid', 'ok_hex32'):
+            before = self.recorded()
+            out = self.call('store: strict valid id fact', mode=mode)
+            self.assertIn('Saved:', out, mode)
+            self.assertIn('verified by read-back', out, mode)
+            self.assertIn('retitle dddddddd', out, mode)
+            self.assertEqual([a[0] for a in self.recorded()[len(before):]], ['remember', 'show'], mode)
+        # 合法 id 存储后 Stop 免催仍成立（mark_store 正常登记）
+        out = self.call('store: strict valid id fact')
+        self.assertIn('Saved:', out)
+        self.assertEqual(self.call(event='Stop'), '')
 
     def test_readback_full_verification(self):
         out = self.call('store: full verify fact', mode='show_wrongid')
