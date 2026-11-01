@@ -33,7 +33,7 @@ def allowed_process(executable, argv, expected_argv, windows):
 # match the next expected invocation exactly (store legitimately chains
 # remember -> show read-back / remember -> list verification).
 LAUNCHER = r'''
-import json, os, pathlib, runpy, sys
+import json, os, pathlib, runpy, subprocess, sys
 case = pathlib.Path(os.environ['RESPITE_CONFIG']).resolve().parent
 expected = os.environ['TEST_ENGINE']
 expected_argv = json.loads(os.environ['TEST_EXPECTED_ARGV'])
@@ -45,9 +45,25 @@ assert config['rsrs'] == expected and os.access(expected, os.X_OK)
 sys.path.insert(0, str(pathlib.Path(os.environ['TEST_HOOK']).parents[1] / 'tests'))
 from test_ci import allowed_process
 state = {'next': 0}
+owned = set()
+original_popen = subprocess.Popen
+def tracked_popen(*args, **kwargs):
+    child = original_popen(*args, **kwargs)
+    if isinstance(child.args, (list, tuple)) and child.args[0] == expected:
+        owned.add(child.pid)
+    return child
+subprocess.Popen = tracked_popen
 def audit(event, args):
     if event == 'subprocess.Popen':
         executable, argv, cwd, env = args
+        if os.name == 'nt':
+            taskkill = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'taskkill.exe')
+            for pid in owned:
+                cleanup = [taskkill, '/PID', str(pid), '/T', '/F']
+                if allowed_process(executable, argv, cleanup, True):
+                    with pathlib.Path(os.environ['TEST_CLEANUP']).open('a', encoding='utf-8') as f:
+                        f.write(str(pid)+'\n')
+                    return
         index = state['next']
         if index >= len(expected_argv) or not allowed_process(executable, argv, expected_argv[index], os.name == 'nt'):
             pathlib.Path(os.environ['TEST_DENIED']).write_text('unexpected subprocess')
@@ -79,7 +95,13 @@ mode = os.environ.get('STUB_MODE', 'ok')
 list_mode = os.environ.get('STUB_LIST', mode)
 if mode == 'dead': sys.exit(7)
 if mode == 'malformed': print('not json'); sys.exit(0)
-if mode == 'hang': time.sleep(30)
+if mode in ('hang', 'hang_tree'):
+    from pathlib import Path
+    Path(os.environ['TEST_CHILD_PID']).write_text(str(os.getpid()), encoding='utf-8')
+    if mode == 'hang_tree':
+        import subprocess
+        subprocess.Popen([sys.executable, '-c', "import os,time;from pathlib import Path;Path(os.environ['TEST_GRANDCHILD_PID']).write_text(str(os.getpid()),encoding='utf-8');time.sleep(30)"])
+    time.sleep(30)
 if sub == 'recall':
     print(json.dumps({'status':'ok','details':[{'id':'cccccccccccccccc','title':'spy','score':0.9}]}))
 elif sub == 'remember':
@@ -173,6 +195,8 @@ else: sys.exit(1)
                         RESPITE_TURN_STATE=str(self.case / 'turn-state'),
                         RESPITE_DATA=str(self.case / 'plugin-data'),
                         KIMI_PLUGIN_DATA=str(self.case / 'plugin-data'),
+                        TEST_CHILD_PID=str(self.case/'child.pid'), TEST_GRANDCHILD_PID=str(self.case/'grandchild.pid'),
+                        TEST_CLEANUP=str(self.case/'cleanup.pids'),
                         TEST_ENGINE=str(self.engine), TEST_CALLS=str(self.calls),
                         TEST_DENIED=str(self.denied), TEST_HOOK=str(ROOT / 'hooks/respire.py'),
                         PYTHONDONTWRITEBYTECODE='1', PYTHONUTF8='1')
@@ -435,6 +459,33 @@ else: sys.exit(1)
                         extra_env={'RESPITE_HOOK_BUDGET_S': '4'})
         self.assertLess(time.monotonic() - started, 4)
         self.assertIn('store unknown', out)
+        self.assertEqual([a[0] for a in self.recorded()], ['remember'])
+
+    def test_timeout_kills_wrapper_and_descendant_pipe_holders(self):
+        import time
+        started = time.monotonic()
+        out = self.call('store: synthetic tree timeout', mode='hang_tree',
+                        extra_env={'RESPITE_HOOK_BUDGET_S': '4'})
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertIn('store unknown', out)
+        for filename in ('child.pid', 'grandchild.pid'):
+            pid = int((self.case / filename).read_text(encoding='utf-8'))
+            if os.name == 'nt':
+                result = subprocess.run(['tasklist.exe', '/NH', '/FI', f'PID eq {pid}'],
+                                        capture_output=True, text=True, timeout=2)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotRegex(result.stdout, rf'\s{pid}\s')
+            else:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    continue
+                # Linux may retain an exited orphan as a zombie until init reaps it.
+                stat = Path(f'/proc/{pid}/stat')
+                self.assertTrue(stat.exists() and stat.read_text().split(') ', 1)[1].startswith('Z'),
+                                f'fixture descendant {pid} still running')
+        if os.name == 'nt':
+            self.assertTrue((self.case/'cleanup.pids').read_text(encoding='utf-8').strip())
         self.assertEqual([a[0] for a in self.recorded()], ['remember'])
 
     def test_verify_list_schema_failures_are_not_attribution(self):

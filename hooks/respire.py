@@ -180,10 +180,53 @@ def find_rsrs(cfg: dict):
     return None
 
 
-def run_rsrs(bin_path: str, args: list, timeout: int):
-    # rsrs 的 --json 模式下进度写 stderr，capture 须分离，只解析 stdout
-    return subprocess.run([bin_path] + args, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=timeout)
+def _kill_cli_tree(child):
+    """Terminate only this invocation's tree, with bounded cleanup and no output capture."""
+    if os.name == "nt":
+        # Killing cmd.exe alone leaves its Python/CLI child holding stdout open.
+        taskkill = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
+        try:
+            subprocess.run([taskkill, "/PID", str(child.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=1, check=False)
+        except Exception:
+            pass
+    else:
+        import signal
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if child.poll() is None:
+        child.kill()
+
+
+def run_rsrs(bin_path: str, args: list, timeout: float):
+    # A dedicated POSIX group or Windows /T cleanup owns descendants as well as wrappers.
+    child = subprocess.Popen([bin_path] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, encoding="utf-8", errors="replace",
+                             start_new_session=os.name != "nt")
+    try:
+        stdout, stderr = child.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_cli_tree(child)
+        try:
+            child.communicate(timeout=0.4)
+        except subprocess.TimeoutExpired:
+            # Never repeat communicate() without a deadline: a failed tree kill must
+            # not turn a timed-out write into an indefinitely blocked hook.
+            if child.poll() is None:
+                child.kill()
+            try:
+                child.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                pass
+        # TimeoutExpired includes the entire command/prompt; expose only a fixed cause.
+        raise TimeoutError("engine deadline exceeded") from None
+    except BaseException:
+        _kill_cli_tree(child)
+        raise
+    return subprocess.CompletedProcess([bin_path] + args, child.returncode, stdout, stderr)
 
 
 def extract_title(content: str) -> str:

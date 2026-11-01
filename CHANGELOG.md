@@ -2,6 +2,8 @@
 
 ## 0.1.6 — 2026-11-01
 
+- Bound CLI timeout cleanup across wrapper/child trees (Windows taskkill on the owned PID; POSIX process group). Verify descendants cannot keep response pipes open after the deadline.
+
 - Reject invalid write IDs and mismatched/non-string read-back fields; preserve committed receipts without retries.
 - Filter internal prompts before rearming; Stop uses only its one-shot latch, never stale write snapshots. Clamp remember/read-back/verification to one monotonic budget.
 
