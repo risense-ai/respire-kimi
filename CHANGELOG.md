@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.6 — 2026-11-01
+
+- Reject invalid write IDs and mismatched/non-string read-back fields; preserve committed receipts without retries.
+- Filter internal prompts before rearming; Stop uses only its one-shot latch, never stale write snapshots. Clamp remember/read-back/verification to one monotonic budget.
+
+
 ## 0.1.5 — 2026-11-01 · 复审第三轮（P2）：id 白名单严格化
 
 ### Fixed

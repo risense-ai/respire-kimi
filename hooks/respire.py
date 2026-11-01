@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 
 # 超时窗（秒）：须盖住 rsrs runtime 冷启动（实测 doctor 模型加载 7s+），否则首轮静默、热后即灵
 RECALL_T = 14
@@ -207,7 +207,7 @@ TURN_FRESH_S = 1800  # 本轮写回执的新鲜度上限：超窗视为陈旧，
 # 一次收尾锁（复核整改）：每会话独立锁文件，O_CREAT|O_EXCL 原子独占——并发 Stop 只有一个能落锁；
 # 锁不设 TTL：只有新的真实请求（mark_prompt）会删除它重新武装；无法落锁（目录不可写等）一律放行，
 # 绝不在没有锁保护的情况下 block。写回执/时刻存于尽力维护的 per-session map（temp+rename 原子替换），
-# map 失败只损失免催优化，不影响一次上限保证。
+# map 仅作诊断，不参与 Stop 决策；失败或旧快照回滚均不影响一次锁。
 
 
 def _turn_dir():
@@ -299,57 +299,44 @@ def mark_prompt(session: str):
 
 
 def mark_store(session: str):
-    """本层「记：」成功回执（ok/warn + 有效 id）：尽力记录本轮已存凭证，Stop 免催。"""
+    """本层「记：」成功回执（ok/warn + 有效 id）：尽力记录诊断时刻，不作为 Stop 免催凭证。"""
     _map_update(session, {"store_ts": time.time()})
 
 
 def turn_stored(session: str) -> bool:
-    """本轮（同会话、prompt 之后、新鲜窗内）已有成功写回执。map 失效时保守返回 False。"""
-    if not session:
-        return False
-    e = _map_load().get(session)
-    if not isinstance(e, dict):
-        return False
-    st = e.get("store_ts")
-    pt = e.get("prompt_ts")
-    if not isinstance(st, (int, float)) or not isinstance(pt, (int, float)):
-        return False
-    return st >= pt and time.time() - st < TURN_FRESH_S
+    """Receipt snapshots are diagnostic only; Stop never trusts them to skip its one nudge."""
+    return False
 
 
 def readback(bin_path: str, sid: str, title: str, content: str, cfg: dict, budget_s: float):
-    """写后核验（R11）：show 回读，校验条目存在且标题/正文头一致。
-    返回 verified / mismatch / unavailable；超预算直接 unavailable。"""
+    """Verify native-string identity, title and full body; bad reads never erase a write receipt."""
+    started = time.monotonic()
+    def finish(verdict):
+        log_event(cfg, "readback", verdict, "", (time.monotonic() - started) * 1000)
+        return verdict
     if budget_s < 2:
-        return "unavailable"
-    t0 = time.time()
+        return finish("unavailable")
     try:
-        r = run_rsrs(bin_path, ["show", sid, "--json"], min(SHOW_T, max(2, int(budget_s))))
+        r = run_rsrs(bin_path, ["show", sid, "--json"], min(SHOW_T, budget_s))
         doc = json.loads(r.stdout) if r.stdout else {}
-    except Exception as e:
-        log_event(cfg, "readback", "error", f"{type(e).__name__}", (time.time() - t0) * 1000)
-        return "unavailable"
-    ms = (time.time() - t0) * 1000
-    if not isinstance(doc, dict) or doc.get("status") != "ok":
-        log_event(cfg, "readback", "not_ok", str(doc.get("status") if isinstance(doc, dict) else "?"), ms)
-        return "unavailable"
-    entry = (doc.get("details") or {}).get("entry")
-    if not isinstance(entry, dict):
-        log_event(cfg, "readback", "no_entry", "", ms)
-        return "unavailable"
-    summ = doc.get("summary")
-    rid = str(summ.get("id") or "") if isinstance(summ, dict) else ""
-    if rid != sid:  # 返回的是别的条目：不是本条核验通过
-        log_event(cfg, "readback", "mismatch", f"id={rid[:8]}!={sid[:8]}", ms)
-        return "mismatch"
-    et, ec = str(entry.get("title") or ""), str(entry.get("content") or "")
-    bad_title = bool(title) and et != title
-    bad_body = content.strip() != ec.strip()  # 完整正文比对（去首尾空白规范化）
-    if bad_title or bad_body:
-        log_event(cfg, "readback", "mismatch", f"title={bad_title} body={bad_body}", ms)
-        return "mismatch"
-    log_event(cfg, "readback", "verified", sid[:8], ms)
-    return "verified"
+        if not isinstance(doc, dict) or doc.get("status") != "ok":
+            return finish("unavailable")
+        details = doc.get("details")
+        entry = details.get("entry") if isinstance(details, dict) else None
+        if not isinstance(entry, dict):
+            return finish("unavailable")
+        summary = doc.get("summary")
+        rid = summary.get("id") if isinstance(summary, dict) else None
+        eid = entry.get("id")
+        if not (isinstance(rid, str) and rid == sid and isinstance(eid, str) and eid == sid):
+            return finish("mismatch")
+        et, ec = entry.get("title"), entry.get("content")
+        if not isinstance(et, str) or not isinstance(ec, str):
+            return finish("mismatch")
+        return finish("verified" if et == title and ec.strip() == content.strip() else "mismatch")
+    except Exception:
+        # remember already committed: retain Saved, never retry on a malformed read.
+        return finish("unavailable")
 
 
 def verify_recent_write(bin_path: str, t0: float, max_wait: float = 0):
@@ -388,11 +375,22 @@ def do_store(bin_path: str, content: str, cfg: dict, session: str = "") -> str:
         log_event(cfg, "store", "empty_content")
         return ""
     title = extract_title(content) or "respire 快存"
-    t0 = time.time()
+    t0 = time.time()  # wall clock only for read-only timestamp hints
+    mono0 = time.monotonic()
+    try:
+        budget = float(os.environ.get("RESPITE_HOOK_BUDGET_S") or 20)
+    except ValueError:
+        budget = 20.0
+    if not (0 < budget < float("inf")):
+        budget = 20.0
+    deadline = mono0 + budget - 2.5
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return "【respire · not stored】No write was sent: hook budget exhausted."
     r = None
     try:
         r = run_rsrs(bin_path, ["remember", content, "--title", title,
-                                "--importance", "important", "--json"], STORE_T)
+                                "--importance", "important", "--json"], min(STORE_T, remaining))
     except Exception as e:
         log_event(cfg, "store", "timeout_or_error", f"{type(e).__name__}: {e}", (time.time() - t0) * 1000)
     ms = (time.time() - t0) * 1000
@@ -418,7 +416,8 @@ def do_store(bin_path: str, content: str, cfg: dict, session: str = "") -> str:
     if parse_ok and sid and status in ("ok", "warn"):
         mark_store(session)
         if status == "warn":
-            warns = [str(e) for e in (doc.get("errors") or []) if isinstance(e, (str, int, float))][:3]
+            warns = [str(e) for e in (doc.get("errors") if isinstance(doc.get("errors"), list) else [])
+                     if isinstance(e, (str, int, float))][:3]
             out = "【respire · stored】Saved with warnings"
             if warns:
                 out += " (" + "; ".join(warns)[:160] + ")"
@@ -428,11 +427,11 @@ def do_store(bin_path: str, content: str, cfg: dict, session: str = "") -> str:
             out = f"【respire · stored】Saved: {title} ({sid[:8]})."
             log_event(cfg, "store", "ok", sid[:8], ms)
         rb = readback(bin_path, sid, title, content, cfg,
-                      (float(os.environ.get("RESPITE_HOOK_BUDGET_S") or 20) - 2.5) - (time.time() - t0))
+                      deadline - time.monotonic())
         if rb == "verified":
-            out += " Write verified by read-back (entry exists; title and content match)."
+            out += " Write verified by read-back (entry exists; id, title and full content match)."
         elif rb == "mismatch":
-            out += (" Read-back shows a DIFFERENT title/content than sent — inspect rsrs show "
+            out += (" Read-back shows a DIFFERENT id/title/content than sent — inspect rsrs show "
                     f"{sid[:8]} before any retitle.")
         else:
             out += f" Read-back unavailable — if it matters, verify with rsrs show {sid[:8]}."
@@ -473,7 +472,7 @@ def do_store(bin_path: str, content: str, cfg: dict, session: str = "") -> str:
 
     # —— 结果未知：坏信封/无输出（engine 秒回）→ 剩余预算足够才只读查库 ——
     if r is not None:
-        budget_s = float(os.environ.get("RESPITE_HOOK_BUDGET_S") or 20) - 2.5 - (time.time() - t0)
+        budget_s = deadline - time.monotonic()
         hit = None
         if budget_s >= 1.5:
             try:
@@ -757,11 +756,7 @@ def on_stop(data: dict, cfg: dict, engine) -> str:
     if not latch_claim(session):
         log_event(cfg, "stop", "once_latch_skip")
         return ""
-    if turn_stored(session):
-        log_event(cfg, "stop", "stored_turn_skip", "src=receipt")
-        return ""
-    # 复核整改：移除「全库最新写入时间晚于本轮 prompt 即免催」——引擎侧写入无法归属到
-    # 本会话/本请求（其他会话并行写入会误抑制）。免催只认可归属凭证：本层成功写回执。
+    # Stop does not consume the diagnostic receipt map or global engine timestamps.
     log_event(cfg, "stop", "nudge")
     return json.dumps({"hookSpecificOutput": {"permissionDecision": "deny",
                                               "permissionDecisionReason": STORE_NUDGE}},
@@ -774,19 +769,22 @@ def on_prompt(data: dict, cfg: dict, engine) -> str:
         log_event(cfg, "prompt", "bad_prompt", "非字符串")
         return ""
     prompt = prompt.strip()
-    nudge = take_pending_nudge()   # SessionStart 挂起引导置顶带出（Kimi SessionStart 输出不进上下文）
+    nudge = ""  # Only a real prompt may consume deferred SessionStart guidance.
     if not prompt:
         log_event(cfg, "prompt", "nomem_or_empty", prompt[:40])
         return nudge
     session = str(data.get("session_id") or "")
-    mark_prompt(session)  # /nomem 只跳召回，仍是新请求（重新武装收尾锁）（T11/T18）
     if SKIP_PREFIX.match(prompt):
+        nudge = take_pending_nudge()
+        mark_prompt(session)  # A real /nomem request skips recall, not request registration.
         log_event(cfg, "prompt", "nomem_or_empty", prompt[:40])
         return nudge
     for pat in (cfg.get("skip_prefixes") or []):   # 宿主内部提示白名单：不召回不落库
         if isinstance(pat, str) and pat and prompt[:len(pat)].lower() == pat.lower():
             log_event(cfg, "prompt", "internal_skip", pat)
             return nudge
+    nudge = take_pending_nudge()
+    mark_prompt(session)  # Internal prompts above never rearm the one-shot latch.
     if contains_secret(prompt):
         # 只记固定原因码：redact 不覆盖 api_key/token/secret 普通赋值与 Bearer 值，
         # 落任何输入摘要都可能把凭据带进日志——凭据轮日志零内容

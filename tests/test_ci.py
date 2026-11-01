@@ -37,7 +37,7 @@ import json, os, pathlib, runpy, sys
 case = pathlib.Path(os.environ['RESPITE_CONFIG']).resolve().parent
 expected = os.environ['TEST_ENGINE']
 expected_argv = json.loads(os.environ['TEST_EXPECTED_ARGV'])
-assert isinstance(expected_argv, list) and expected_argv
+assert isinstance(expected_argv, list)  # Empty sequence strictly requires zero child processes.
 for argv in expected_argv:
     assert isinstance(argv, list) and argv[0] == expected
 config = json.loads(pathlib.Path(os.environ['RESPITE_CONFIG']).read_text(encoding="utf-8"))
@@ -182,7 +182,7 @@ else: sys.exit(1)
         self.config.write_text(json.dumps({'rsrs':str(self.engine), 'session_rules':True,
                                           'store_nudge_every':every}), encoding="utf-8")
         if event == 'Stop':
-            args_seq = [['list','--limit','3','--json']]
+            args_seq = []  # Stop must never invoke the CLI.
         elif event == 'SessionStart':
             args_seq = [['status','--json']]
         elif prompt.startswith(('记：','store:')):
@@ -304,7 +304,7 @@ else: sys.exit(1)
 
     def test_store_readback_states(self):
         self.assertIn('verified by read-back', self.call('store: durable fixture fact'))
-        self.assertIn('DIFFERENT title/content',
+        self.assertIn('DIFFERENT id/title/content',
                       self.call('store: durable fixture fact', mode='show_mismatch'))
         self.assertIn('Read-back unavailable',
                       self.call('store: durable fixture fact', mode='show_fail'))
@@ -404,10 +404,10 @@ else: sys.exit(1)
             self.assertIn('verified by read-back', out, mode)
             self.assertIn('retitle dddddddd', out, mode)
             self.assertEqual([a[0] for a in self.recorded()[len(before):]], ['remember', 'show'], mode)
-        # 合法 id 存储后 Stop 免催仍成立（mark_store 正常登记）
+        # A committed receipt is preserved, but it never suppresses the one Stop nudge.
         out = self.call('store: strict valid id fact')
         self.assertIn('Saved:', out)
-        self.assertEqual(self.call(event='Stop'), '')
+        self.assertEqual(json.loads(self.call(event='Stop'))['hookSpecificOutput']['permissionDecision'], 'deny')
 
     def test_readback_full_verification(self):
         out = self.call('store: full verify fact', mode='show_wrongid')
@@ -428,6 +428,15 @@ else: sys.exit(1)
         self.assertIn('Do NOT resend', out)
         self.assertEqual(len(self.recorded()) - len(before), 1)
 
+    def test_hanging_remember_is_clamped_to_total_budget(self):
+        import time
+        started = time.monotonic()
+        out = self.call('store: synthetic hanging write', mode='hang',
+                        extra_env={'RESPITE_HOOK_BUDGET_S': '4'})
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertIn('store unknown', out)
+        self.assertEqual([a[0] for a in self.recorded()], ['remember'])
+
     def test_verify_list_schema_failures_are_not_attribution(self):
         for mode in ('list_schema', 'list_notimes'):
             out = self.call('store: schema fact', mode='silent', list_mode=mode)
@@ -436,12 +445,12 @@ else: sys.exit(1)
     def test_stop_after_hook_store_does_not_query_engine(self):
         self.call('store: durable fixture fact')
         before = self.recorded()
-        self.assertEqual(self.call(event='Stop'), '')
+        self.assertEqual(json.loads(self.call(event='Stop'))['hookSpecificOutput']['permissionDecision'], 'deny')
         self.assertEqual(self.recorded(), before)
 
     def test_turn_receipt_suppression_is_request_scoped(self):
         self.call('store: durable fixture fact')
-        self.assertEqual(self.call(event='Stop'), '')
+        self.assertEqual(json.loads(self.call(event='Stop'))['hookSpecificOutput']['permissionDecision'], 'deny')
         self.call('another ordinary input without storing')
         self.assertEqual(json.loads(self.call(event='Stop'))
                          ['hookSpecificOutput']['permissionDecision'], 'deny')

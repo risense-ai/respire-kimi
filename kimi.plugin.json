@@ -1,6 +1,6 @@
 {
   "name": "respire",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "respire memory for Kimi Code: every-round title-tier recall, one-prefix store, model-optional degradation. On-machine registration via rsrs register for sync; the sidecar model is an optional boost.",
   "keywords": ["memory", "respire", "rsrs", "recall", "hooks", "local-first"],
   "author": "risense-ai",
