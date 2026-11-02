@@ -1,6 +1,6 @@
 {
   "name": "respire",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "respire memory for Kimi Code: every-round title-tier recall, prefix-requested storage, model-optional degradation. On-machine registration via rsrs register for sync; the sidecar model is an optional boost.",
   "keywords": ["memory", "respire", "rsrs", "recall", "hooks", "local-first"],
   "author": "risense-ai",
@@ -13,6 +13,7 @@
   "hooks": [
     { "event": "SessionStart", "matcher": "startup|resume", "command": "python3 \"./hooks/respire.py\" SessionStart || python \"./hooks/respire.py\" SessionStart", "timeout": 20 },
     { "event": "UserPromptSubmit", "command": "python3 \"./hooks/respire.py\" UserPromptSubmit || python \"./hooks/respire.py\" UserPromptSubmit", "timeout": 20 },
+    { "event": "PreToolUse", "command": "python3 \"./hooks/respire.py\" PreToolUse || python \"./hooks/respire.py\" PreToolUse", "timeout": 20 },
     { "event": "Stop", "command": "python3 \"./hooks/respire.py\" Stop || python \"./hooks/respire.py\" Stop", "timeout": 20 }
   ],
   "interface": {

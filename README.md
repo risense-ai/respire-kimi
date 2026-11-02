@@ -28,7 +28,7 @@
 | 档 | 怎么关 | 范围 |
 | --- | --- | --- |
 | 单轮 | prompt 前缀 `/nomem` | 只关本轮召回 |
-| 总开关 | `hooks/respire.config.json` 设 `"enabled": false` | 记忆层全线静默（召回/落库/存储检查），hook.log 留 `disabled` 痕 |
+| 总开关 | `hooks/respire.config.json` 设 `"enabled": false` | Automatic recall and storage guidance stop; the installed placement guard stays active，hook.log 留 `disabled` 痕 |
 | 插件级 | `/plugins disable respire` | Kimi 侧整插件卸力 |
 
 ## 装上后发生什么
@@ -65,7 +65,7 @@
 | `min_prompt_chars` | `2` | 1 字才跳，2 字起即查 |
 | `session_rules` | `true` | SessionStart 是否做状态探测并写 `.pending_nudge` 引导（Kimi 下简则由 `systemPromptPath` 常驻承担，此开关只管探测引导） |
 | `budget_chars` | `1500` | 单轮注入总预算（标题行远短于此） |
-| `enabled` | `true` | **总开关**：false=全线静默 |
+| `enabled` | `true` | false disables automatic guidance; installed placement checks remain active |
 | `store_nudge_every` | `1` | Stop 存储检查节流：1=每轮、N=每 N 轮、0=关（每轮=多一轮模型小调用） |
 | `log` | `true` | `hooks/hook.log` 留痕（超 256KB 清轮） |
 | `skip_prefixes` | `[]` | 宿主内部提示白名单：命中这些前缀（大小写不敏感）的 prompt 不召回也不落库 |
@@ -80,7 +80,7 @@
 
 ## 设计要点
 
-- **fail-open**：hook 任何异常 → 空 stdout + `exit 0`，永不拦会话；失败必留痕于 hook.log（口令/token/长数字脱敏）
+- **fail-open for automatic guidance**: guidance errors remain silent and exit 0; identified PreToolUse memory writes deny on guard or parent-verification errors. Denial messages never echo command contents.
 - **Kimi 适配点**（相对 dimcode/qoder/workbuddy  siblings）：
   - SessionStart 是观察型事件、**stdout 不进模型上下文**——Dim 系「SessionStart 注简则」方案在 Kimi 不可移植。替代：规则走 `systemPromptPath`（常驻系统提示）+ `sessionStart.skill`（每会话加载 playbook）；状态探测引导改**写 `.pending_nudge` 状态文件**，由首个 UserPromptSubmit 读出、删除并置顶带出
   - Stop 阻断用 Kimi 文档 JSON：`hookSpecificOutput.permissionDecision:"deny"` + `permissionDecisionReason` 打 stdout、exit 0（与 fail-open 同路，不用 exit 2）
@@ -118,6 +118,14 @@ GitHub Actions 在 Linux、Windows、macOS 上运行结构校验、临时桩行�
 通过审核后的 `vMAJOR.MINOR.PATCH` 标签触发发布，ZIP 保留插件根目录布局并附带 SHA256SUMS。安装仍使用本文原有仓库安装说明。恢复已存在标签时，从 main 手动运行工作流并提供标签及其完整提交 SHA；只归档该提交，不移动标签，不覆盖冲突资产。构建默认只读，写权限仅在受控发布 job 内使用仓库 GITHUB_TOKEN，无新增 secret。
 
 这些测试不能代替真实 Kimi 宿主、安装后的解释器回退或真实引擎验收；任何版本或回执兼容测试失败都阻止发布。
+
+### PreToolUse write guard
+
+Before visible Bash calls, the hook parses literal rsrs remember/update/attach arguments and every command in a sequence. It rejects force bypasses, important creation without a parent, explicit empty or invalid parents, and identified dynamic or wrapped memory writes. Use one explicit literal command when parsing is refused. Non-memory commands and read-only calls remain silent.
+
+A non-empty parent must be an ID that an existing runner can verify with `rsrs --client-only show <id> --json`. Verification has a 16-second total budget inside the 20-second hook timeout; missing runners, errors, malformed receipts and timeouts deny the write and leave placement pending. No runtime is started and the hook never writes memory. Denials contain only static English guidance and exit 0, so the Python fallback cannot swallow them. Automatic guidance still honors the enabled switch; this placement guard remains active while the hook component is installed.
+
+Host-visible `memory_remember`, `memory_update` and `memory_attach` MCP names, including `mcp__<server>__memory_*`, are denied because the hook cannot bind an arbitrary MCP server to the local target profile. Use an explicit rsrs command through the guarded shell instead. This is not a general shell sandbox: aliases, arbitrary external scripts, hidden API calls and tools that do not emit PreToolUse remain outside its visibility. A verified parent exists; the model must still read its full body and judge relevance before writing. Actual model termination and installation behavior require host verification.
 
 ### Stop verification boundary
 

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.8 — 2026-11-02
+
+- Add PreToolUse JSON denial for important writes without a verified parent, force bypasses, explicit parent clearing and opaque memory commands.
+- Verify literal parents with client-only show, preserve unrelated tools and document the interception boundary.
+
 ## 0.1.7 — 2026-11-02
 
 - Store prefixes now write nothing and hand placement to the model: read engine policy and candidate bodies, then update > merge > attach > new.

@@ -141,8 +141,8 @@ hooks = (manifest or {}).get("hooks")
 if hooks is not None:
     if not isinstance(hooks, list):
         fail("manifest hooks must be a JSON array")
-    elif len(hooks) != 3:
-        fail(f"manifest hooks must have exactly 3 rules, got {len(hooks)}")
+    elif len(hooks) != 4:
+        fail(f"manifest hooks must have exactly 4 rules, got {len(hooks)}")
     else:
         allowed = {"event", "matcher", "command", "timeout"}
         events = []
@@ -162,8 +162,8 @@ if hooks is not None:
             t = rule.get("timeout")
             if not isinstance(t, int) or isinstance(t, bool) or t <= 0 or t > 600:
                 fail(f"{rule.get('event')}: timeout must be a positive int <= 600, got {t!r}")
-        if set(events) != {"SessionStart", "UserPromptSubmit", "Stop"}:
-            fail(f"hook events must be exactly SessionStart/UserPromptSubmit/Stop, got {sorted(events)}")
+        if set(events) != {"SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"}:
+            fail(f"hook events must be exactly SessionStart/UserPromptSubmit/PreToolUse/Stop, got {sorted(events)}")
         else:
             ok("hook events set")
         for rule in hooks:
