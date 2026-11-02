@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # respire 自测（Kimi Code 版）—— 模拟 stdin 事件 JSON，逐分支断言。
 # rsrs 无 data-dir 隔离（runtime 单例＋全局 client.json），故默认只读分支不碰库；
-# 加 --store 才跑写探针（写真库→回执断言→rsrs forget 自清理）。
+# --store is retained for compatibility; prefixes never write.
 # Kimi 适配：SessionStart stdout 恒为空（观察型事件，输出不进模型上下文），
 # 引导断言一律走 .pending_nudge 状态文件（RESPITE_PENDING_NUDGE 覆写路径，首条 prompt 带出即删）。
 set -u
@@ -365,6 +365,12 @@ SYN_KEY="synthetic""0123456789abcdef"         # api_key= 赋值：SECRET_RE 命�
 SYN_TOKEN="sk-""synthetic""0123456789abcdef"  # sk- 令牌：SECRET_RE 的 sk- 分支命中
 SYN_BEARER="Bearer ""synthetic""zzzyyxxxwww"  # Bearer 值：SECRET_RE 命中；redact 同样不覆盖
 check "疑似凭据不发引擎" "$(run UserPromptSubmit "api_key = ${SYN_TOKEN} 存一下")" "含:contains a credential"
+for prefix in 'remember:' 'store:' '记：' '存：'; do
+  BEFORE="$(calls_n)"
+  out=$(run UserPromptSubmit "$prefix durable fixture fact" "$CFG_SPY")
+  check "prefix pending ($prefix)" "$out" "含:Nothing was written"
+  check "prefix zero engine calls ($prefix)" "$( [ "$(calls_n)" = "$BEFORE" ] && echo SAME || echo CALLED )" "含:SAME"
+done
 check "疑似凭据不落库" "$(run UserPromptSubmit "记：数据库密码 = hunter2u")" "含:contains a credential"
 # ---- 合成凭据守卫与守卫说明见下方 SYN 定义之后；nonce=synthetic 供 grep 断言零泄漏。----
 SECRET_LOG="$TMP/secret.log"; : > "$SECRET_LOG"
@@ -441,36 +447,11 @@ unset STUB_MODE
 check "兜底清理-失败分支退出码非零" "$( [ "$GF_RC" = 2 ] && echo EXPLICIT || echo SILENT )" "含:EXPLICIT"
 check "兜底清理-失败分支显式报告" "$GF_OUT" "含:FAIL（兜底清理失效）"
 
-# ---- 写探针（--store 显式开启；写真库→断言→forget 清理） ----
+# ---- Legacy --store option: prefixes now always hand placement to the model. ----
 if [ "$WITH_STORE" = 1 ]; then
-  # 内容须与全库零语义关联：纯随机无义串（域词如「探针/测试/记忆」会撞 30%+ 相似走待决态）
-  MARK="zq$(date +%s)$RANDOM kw7f2 随机标记无义串"
-  out=$(run UserPromptSubmit "记：$MARK")
-  if printf '%s' "$out" | grep -qF "store pending"; then
-    PASS=$((PASS+1)); echo "SKIP  随机串判重待决（实时库判重门收紧，ok 回执路径由 CI 桩覆盖）"
-  else
-    check "落库成功回执" "$out" "含:Saved:"
-    check "回执约束AI抽事实句retitle" "$out" "含:rsrs retitle"
-    SID=$(printf '%s' "$out" | sed -n 's/.*(\([0-9a-f]\{8\}\)).*/\1/p')
-    check "回执带短 id" "$SID" "非空"
-    if [ -n "$SID" ]; then
-      rc=$(rsrs forget "$SID" --json 2>/dev/null | jq -r '.status // "err"')
-      check "探针清理(status=ok)" "$rc" "含:ok"
-    fi
-  fi
-  # 判重待决：复述库中稳定条目（1memory 更名 respire）→ 必撞高相似 → pending 未写入
-  out=$(run UserPromptSubmit "记：1memory 更名 respire：吸即存呼即取，材料全线改（复述既有条目触发判重待决）")
-  check "判重待决转述候选" "$out" "含:store pending"
-  check "待决列出候选与决断法" "$out" "含:--force"
-  # 兜底：万一判为直写（库条变更），probe_cleanup 负责清理；rc=2（应清未清/解析失败）显式 FAIL 不静默
-  CL_OUT="$(probe_cleanup "$out" "判重探针")"; CL_RC=$?
-  if [ "$CL_RC" = 2 ]; then
-    FAIL=$((FAIL+1)); echo "FAIL  判重探针兜底清理  详情[$(printf '%s' "$CL_OUT" | head -c 200)]"
-  else
-    PASS=$((PASS+1)); echo "PASS  判重探针兜底清理路径(rc=$CL_RC: 1=待决未写 0=直写已清)"
-  fi
-else
-  echo "SKIP  写探针（默认只读；加 --store 开启，写真库并自动 forget 清理）"
+  out=$(run UserPromptSubmit "remember: prefix handoff probe")
+  check "prefix probe does not write" "$out" "含:Nothing was written"
+  check "prefix probe requires read parent" "$out" "含:ONLY AFTER reading the full body"
 fi
 
 echo "----"

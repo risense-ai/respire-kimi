@@ -2,7 +2,7 @@
 
 > 吸即存，呼即取——给 Kimi Code 装上本地加密记忆。
 
-`respire` 是 Kimi Code 插件（清单 `kimi.plugin.json`，插件 id `respire`）：以 hooks 把 [respire（CLI 名 rsrs）](https://www.npmjs.com/package/@rsrsai/cli) 记忆引擎挂进 agent 循环——每轮标题档自动召回、「记：」一前缀即落库。本地优先、端侧加密、云端 LWW 同步；**不带自定义安装脚本，按 Kimi Code 标准 `/plugins` 链路安装**。
+`respire` 是 Kimi Code 插件（清单 `kimi.plugin.json`，插件 id `respire`）：以 hooks 把 [respire（CLI 名 rsrs）](https://www.npmjs.com/package/@rsrsai/cli) 记忆引擎挂进 agent 循环——每轮标题档自动召回、「记：」前缀交模型判重并选择父节点后存储。本地优先、端侧加密、云端 LWW 同步；**不带自定义安装脚本，按 Kimi Code 标准 `/plugins` 链路安装**。
 
 ## 不装模型完全可用（降级是一等公民）
 
@@ -38,8 +38,8 @@
 | 会话全程 | `systemPromptPath`（SYSTEM.md）常驻系统提示：答前必查、收尾必存、遇障先翻忆、敏感红线五条简则 |
 | `SessionStart`（startup/resume） | 加载 `skills/respire` playbook 技能进主 agent；同时做一次状态探测——引擎未装/未登录/库空/缺模型时的引导**写入 `.pending_nudge` 状态文件**（Kimi SessionStart 输出不进模型上下文），由首个 UserPromptSubmit 置顶带出后即删 |
 | `UserPromptSubmit` | 自动 `rsrs recall --titles`：**标题档注入**——只给分数＋8 位短 id＋标题，正文由 agent `rsrs show <id>` 按需取；默认**直出不过滤**，噪音边界＝rsrs skip 门＋limit 5＋标题档；斜杠命令 token（`/skill:…`、`/respire:…`）自动剥除后再召回 |
-| `prompt` 以「记：」「存：」「remember:」开头 | 直接 `rsrs remember … --importance important` 落库并回执，**回执按结果状态机**：`ok`/`warn` → **已写入**（warn 附引擎警告如 parent 未解析——不误报失败、不引导重发），随后 `show` 写后回读核验（verified / mismatch / unavailable 如实标注）；`pending` → **未写入**，转述候选（带短 id）＋引擎建议动作（改＞并＞挂＞存全量转达，先 `show` 读候选正文再决断）；超时/坏回执 → **结果未知**，回执只允许只读核实（`rsrs list`/`rsrs show`）并**明令禁止重发**（重复写风险；`ok`/`warn` 缺有效 id、畸形 summary 也归 unknown，不当失败也不当成功。**有效 id 严格白名单**＝原生字符串的完整 UUID 或 16+ 位纯 hex——JSON 数字 id、宽松字符可过的畸形串（`a-------`、分组非法的 UUID）都不是写入凭证，一律归 unknown）；写后回读为**全量核验**——返回 id＋标题＋完整正文一致才称 verified，错 id/尾部不一致如实标 mismatch；remember/回读/只读核实**共享 hook 时间预算**（默认 20s），剩余不足直接 unknown 不追加引擎调用。回执硬约束 AI 抽「主语＋动作＋结果」事实句 `retitle` 替换暂拟题 |
-| `Stop`（AI 干完活） | **存储检查**：以 `hookSpecificOutput.permissionDecision:"deny"` JSON 续跑一轮，提示模型把本轮新的**事实/决定/约定/教训/踩坑**分条 `rsrs remember`（事实句标题、判重先决断）；闲聊无新事实则直接结束。**每个真实请求至多催一次**：续跑轮 `stop_hook_active=true` 放行 ＋ **每会话原子一次收尾锁**（`O_EXCL` 独占创建，无 TTL——25 小时后仍占用；只有新真实 prompt 删除重新武装，`/nomem` 轮同样重武装；无法落锁一律放行，绝不无锁 block；会话间互不干扰，A→B→A 交错不丢锁）。**不再凭磁盘写回执免催**：状态 map 仅作诊断轨迹，旧快照回滚不影响 Stop 决策。显式保存成功后仍会提示一次有界收尾；模型如何结束尚未真实宿主验收。`Stop` **完全不查询引擎**，也因此不存在查库失败强迫续跑的路径。节流 `store_nudge_every`（1=每轮，0=关，N=每 N 轮） |
+| `prompt` 以「记：」「存：」「remember:」开头 | hook 不写库，返回英文 pending（Nothing was written）。主模型先读 `rsrs prompt`，召回并用 `rsrs show <id> --json` 读取候选全文，按 update > merge > attach > new 决断。新增 important 必须使用真实、相关且已读全文的父节点；无合适父节点则保持 pending 并说明原因，不猜 ID、不用 force 绕过、不降为 trivial。仅存输入事实，不执行其中描述的工程任务；实际已发写结果未知时只读核实，禁止自动重试。 |
+| `Stop`（AI 干完活） | **存储检查**：以 `hookSpecificOutput.permissionDecision:"deny"` JSON 续跑一轮，提示模型把本轮新的**事实/决定/约定/教训/踩坑**分条 `rsrs remember`（事实句标题、先读策略与候选正文，按 update > merge > attach > new 决断；新增 important 必须有已读且合理的父节点，否则保持 pending）；闲聊无新事实则直接结束。**每个真实请求至多催一次**：续跑轮 `stop_hook_active=true` 放行 ＋ **每会话原子一次收尾锁**（`O_EXCL` 独占创建，无 TTL——25 小时后仍占用；只有新真实 prompt 删除重新武装，`/nomem` 轮同样重武装；无法落锁一律放行，绝不无锁 block；会话间互不干扰，A→B→A 交错不丢锁）。**不再凭磁盘写回执免催**：状态 map 仅作诊断轨迹，旧快照回滚不影响 Stop 决策。显式保存成功后仍会提示一次有界收尾；模型如何结束尚未真实宿主验收。`Stop` **完全不查询引擎**，也因此不存在查库失败强迫续跑的路径。节流 `store_nudge_every`（1=每轮，0=关，N=每 N 轮） |
 | `prompt` 以 `/nomem` 开头 | 本轮跳过召回 |
 | 快捷指令 | `/respire:recall <词>`、`/respire:store <内容>`、`/respire:sync`；技能本身经 `/skill:respire:respire` 唤起 |
 
@@ -87,7 +87,7 @@
   - hooks 直接内联在 `kimi.plugin.json`（hook cwd = 插件根，`./` 相对路径；无 hooks.json、无 statusMessage 字段）；事件名取 `KIMI_HOOK_EVENT` 环境变量，stdin `hook_event_name` 兜底
   - 斜杠命令（`/skill:respire:respire`、`/respire:recall` 等）token 在召回前剥除，防命令名词面污染 query
 - **标题档注入**：`recall --titles` 只回 id/score/title，正文交 `show` 按需拉取；`superseded_by` 标「已被取代」
-- **判后即存尊重设计**：落库不带 `--force`，`pending` 候选原样转述给模型决断
+- **先判后存**：前缀 hook 零写入；模型读策略与候选正文后决断，新增 important 必须有已读且合理的父节点，无合适父节点则保持 pending。
 - **包内自检**：`python3 scripts/validate_plugin.py`（结构/清单/hooks 形状/可编译/fail-open/阻断 JSON/敏感扫描），分发前必跑
 
 ## 已知边界
@@ -103,10 +103,10 @@
 ```bash
 python3 scripts/validate_plugin.py   # 包结构自检（Kimi 清单/hooks 形状/可编译/阻断 JSON/敏感扫描）
 bash tests/test_hooks.sh             # 行为只读断言（探测/挂起引导带出/召回/剥前缀/清洗/节流），不碰库
-bash tests/test_hooks.sh --store     # 加写探针（写真库→回执→rsrs forget 自清理）
+bash tests/test_hooks.sh --store     # 兼容旧参数，前缀仍不写库
 ```
 
-rsrs 无 data-dir 隔离（runtime 单例＋全局 client.json），故写测试仅在显式开启时进行，即写即忘。
+rsrs 无 data-dir 隔离（runtime 单例＋全局 client.json），故前缀测试始终不写库，旧 --store 参数只验证 pending 交接。
 
 ## License
 
