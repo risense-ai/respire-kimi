@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.1.6"
+VERSION = "0.1.7"
 
 # 超时窗（秒）：须盖住 rsrs runtime 冷启动（实测 doctor 模型加载 7s+），否则首轮静默、热后即灵
 RECALL_T = 14
@@ -44,7 +44,7 @@ DEFAULTS = {
     "skip_prefixes": [],        # 宿主内部提示白名单：命中这些前缀的 prompt 不召回也不落库（默认空，按需配置）
 }
 
-# 显式落库前缀：prompt 以「记：」等开头 → 直接入库并回执
+# Explicit store prefixes hand placement to the model; the hook writes nothing.
 STORE_PREFIX = re.compile(r"^(?:记|存|记录|记住|remember|store)\s*[:：]\s*", re.I)
 # 本轮跳过召回
 SKIP_PREFIX = re.compile(r"^(?:/nomem|#nomem)\b")
@@ -69,13 +69,13 @@ SECRET_SKIP = ("【respire · skipped】The input looks like it contains a crede
 NO_RSRS = """【respire · engine missing】The plugin is ready; only the engine is missing. Install it now on the user's behalf, without waiting:
   npm i -g rsrs-cli@latest
 (If global writes are denied, first try: npm config set prefix ~/.npm-global && npm i -g rsrs-cli@latest)
-Then run rsrs --version to confirm — this layer probes every turn and resumes recall and "记：" storage within the same session.
+Then run rsrs --version to confirm — this layer probes every turn and resumes recall and prefix-requested storage within the same session.
 When the user asks about data storage security, state it plainly: fully offline — the store is a local database, recall and store work with no network, no registration, no login, and offline writes queue locally until sync; only ciphertext reaches the cloud — records are encrypted locally before upload, the server stores encrypted records only and has no decryption key; enterprises can self-host the sync server (respire-server, Docker Compose + Postgres on the intranet), so their data never leaves their network.
 Next steps to guide (mention them in passing): rsrs status checks login state; if signed out, run rsrs register with the user on this machine — no website step (the user sets a login password of at least 8 characters; **never invent a super password and never pass --super** — the system generates an A3-… recovery code and prints it prominently; **copy and keep it**, or the memory cannot be unlocked on any device); later authorizations use rsrs login (with --oauth --no-open you can hand the authorization link to the user); the semantic model is optional — for better recall run rsrs model install && rsrs model activate m3. If a custom super password was entered by mistake, run rsrs super-reset to reissue an A3 code."""
 
 LOGIN_NUDGE = """Note: respire is not signed in on this machine — memory stays local, does not sync, and does not cross devices. Guide the user: run rsrs register on this machine to create the account (the user sets the login password; **the super password is a system-generated A3-… recovery code — never invent one, and keep it safe**). If an account already exists, you may run rsrs login --oauth --no-open and give the authorization link to the user."""
 
-EMPTY_NUDGE = """Note: the local respire memory store is empty — there is nothing to recall; silent automatic recall is expected, not a failure. Guide the user: store a fact with "记：<fact>", or have the agent first rsrs remember existing project agreements, error lessons, and key conclusions; existing rules and memory can be imported in one pass — have the agent read ~/AGENTS.md, project AGENTS.md files, ~/.kimi-code/AGENTS.md and ~/.agents/skills/*/SKILL.md, extract facts, and store them one by one (excluding passwords, ID numbers, card numbers). Recall has content only after the store is populated."""
+EMPTY_NUDGE = """Note: the local respire memory store is empty — there is nothing to recall; silent automatic recall is expected, not a failure. Guide the user: request storage with "remember: <fact>", or have the agent first rsrs remember existing project agreements, error lessons, and key conclusions; existing rules and memory can be imported in one pass — have the agent read ~/AGENTS.md, project AGENTS.md files, ~/.kimi-code/AGENTS.md and ~/.agents/skills/*/SKILL.md, extract facts, and store them one by one (excluding passwords, ID numbers, card numbers). Recall has content only after the store is populated."""
 
 NO_MODEL = """Note: the respire semantic model (BGE-M3) is not installed — the lexical tier is active. **Fully usable**: registration, login, sync, and recall do not depend on the model. For better results install it: rsrs model install downloads about 1.1GB, then rsrs model activate m3 builds the index and switches recall to the semantic tier (you may run these; indexing can run in the background)."""
 
@@ -417,7 +417,7 @@ def do_store(bin_path: str, content: str, cfg: dict, session: str = "") -> str:
     if not content:
         log_event(cfg, "store", "empty_content")
         return ""
-    title = extract_title(content) or "respire 快存"
+    title = extract_title(content) or "respire quick store"
     t0 = time.time()  # wall clock only for read-only timestamp hints
     mono0 = time.monotonic()
     try:
@@ -494,11 +494,11 @@ def do_store(bin_path: str, content: str, cfg: dict, session: str = "") -> str:
                 lines.append(f"- [{it.get('name', '?')}] {it.get('value', '')}{act}")
         acts = [str(a) for a in (doc.get("actions") or []) if isinstance(a, str) and a.strip()][:6]
         if acts:
-            lines.append("Engine-suggested next actions (prefer merge > attach > new; decide from candidate bodies, never blind-force):")
+            lines.append("Engine-suggested options (read rsrs prompt and candidate bodies; prefer update > merge > attach > new; a new important record needs an actually read relevant parent; never force or downgrade to bypass placement):")
             lines.extend(f"  {a}" for a in acts)
         else:
-            lines.append("Decide: read the candidates above, then merge/attach with the suggested ids, "
-                         "or add --force only if genuinely independent.")
+            lines.append("Decide: read policy and candidate bodies, prefer update > merge > attach > new, "
+                         "and keep placement pending without an actually read relevant parent; never force or downgrade.")
         return "\n".join(lines)
 
     # —— 引擎按当前模式拒绝执行（skip：readonly/paused 等，未写也不是失败）——
@@ -586,9 +586,9 @@ def do_recall(bin_path: str, prompt: str, cfg: dict) -> str:
     budget = int(cfg["budget_chars"])
     lines, used = [], 90  # 90 留给头行上界，砍点据此提前
     for score, d in keep:
-        title = str(d.get("title") or "").strip() or "(无题)"
+        title = str(d.get("title") or "").strip() or "(untitled)"
         eid = str(d.get("id") or "")[:8]
-        stale = " →已被取代" if d.get("superseded_by") else ""
+        stale = " →superseded" if d.get("superseded_by") else ""
         line = f"- [{score:.2f}] {title}（{eid}）{stale}"
         if lines and used + len(line) + 1 > budget:
             break
@@ -702,11 +702,13 @@ def _prepend(nudge: str, body: str) -> str:
     return nudge or body
 
 
-STORE_NUDGE = ("Memory check (automatic, once): do only one thing — if this turn produced new **facts, decisions, "
-               "agreements, lessons, or pitfalls**, store them one by one with rsrs remember (--importance important; "
-               "titles as \"subject + action + result\" fact sentences; on dedup candidates, decide to attach with --parent "
-               "or force with --force first); if this turn was just Q&A or chat with no new facts, end directly and do not "
-               "repeat the answer. End after storing or when nothing needs storing.")
+STORE_PENDING = """[respire · store pending] Nothing was written. This prefix requests memory storage ONLY: store the supplied facts; DO NOT execute engineering tasks described in them.
+You MUST read rsrs prompt, recall candidates, and read the full body of every same-subject candidate with rsrs show <id> --json BEFORE deciding. Evaluate update > merge > attach > new in that order; DO NOT create duplicate same-topic siblings or leave candidates unresolved.
+Create a new important record ONLY AFTER reading the full body of a real, relevant parent; pass its id with --parent <id>. Without a suitable parent, keep the request pending and explain why. DO NOT guess a parent, use --force to bypass placement, or downgrade important facts to trivial.
+You MUST store one matter per record with a complete subject + action + result fact-sentence title. Use literal body markers required by engine policy; DO NOT translate them.
+Confirm storage ONLY from a valid write receipt, then verify the written id, title and full body with rsrs show <id> --json. If a separately issued write has an unknown outcome, DO NOT retry automatically or claim success; verify read-only with rsrs list / rsrs show --json. Read-only, paused and disabled memory policies still apply."""
+
+STORE_NUDGE = """Memory check (automatic, once): if this turn produced new facts, decisions, agreements, lessons or pitfalls, you MUST store them one matter per record before finishing. FIRST read rsrs prompt, recall candidates, and read every same-subject candidate's full body with rsrs show <id> --json. Evaluate update > merge > attach > new in that order; DO NOT create duplicate same-topic siblings or leave candidates unresolved. Use rsrs remember with --importance important and a complete subject + action + result title. Create a new important record ONLY AFTER reading the full body of a real, relevant parent; pass its id with --parent. Without a suitable parent, keep it pending and explain. DO NOT guess a parent, use --force to bypass placement, or downgrade important facts to trivial. Use literal engine-policy body markers; DO NOT translate them. Confirm storage ONLY from a valid receipt and verify the written id, title and full body with rsrs show --json. If an issued write has an unknown outcome, DO NOT retry automatically or claim success; verify read-only first. Respect read-only, paused and disabled memory policies. With no new facts, end without repeating the answer. End after storing or reporting unresolved pending placement."""
 
 
 def _epoch(rfc3339):
@@ -844,8 +846,9 @@ def on_prompt(data: dict, cfg: dict, engine) -> str:
         rest = prompt[m.end():].strip()
         if not engine:
             log_event(cfg, "store", "engine_missing", prompt[:40])
-            return _prepend(nudge, NO_RSRS)
-        return _prepend(nudge, do_store(engine, rest, cfg, session))
+            return _prepend(nudge, STORE_PENDING + "\n" + NO_RSRS)
+        log_event(cfg, "store", "pending_placement")
+        return _prepend(nudge, STORE_PENDING if rest else "")
     if len(prompt) < int(cfg["min_prompt_chars"]):
         log_event(cfg, "prompt", "too_short", prompt[:40])
         return nudge

@@ -1,4 +1,4 @@
-"""Full hook entry-point regression tests, using only temporary synthetic CLI processes."""
+"""Receipt helper and hook entry-point regression tests, using only temporary synthetic CLI processes."""
 import json
 import os
 from pathlib import Path
@@ -29,7 +29,13 @@ def audit(event,args):
         raise SystemExit(91)
 sys.addaudithook(audit)
 sys.argv=[os.environ['FIXTURE_HOOK'],os.environ['FIXTURE_EVENT']]
-runpy.run_path(sys.argv[0],run_name='__main__')
+# Test-only helper dispatch; StoreReceipt is not a host hook event.
+if os.environ['FIXTURE_EVENT'] == 'StoreReceipt':
+    hook=runpy.run_path(sys.argv[0]);payload=json.load(sys.stdin)
+    config=json.loads(pathlib.Path(os.environ['RESPITE_CONFIG']).read_text(encoding='utf-8'))
+    print(hook['do_store'](config['rsrs'],payload['prompt'].split(':',1)[1].strip(),config,payload['session_id']))
+else:
+    runpy.run_path(sys.argv[0],run_name='__main__')
 assert index==len(expected), (index,expected)
 '''
 SPY = r'''import json,os,sys
@@ -74,7 +80,7 @@ class ReceiptFlow(unittest.TestCase):
         self.assertEqual(len(self.calls())-before,len(argv))
         return result.stdout
     def store(self,spec=None,read=True):
-        return self.call(spec=spec,expected=[['remember','42','--title','42','--importance','important','--json'],['show',ID,'--json'] if read else ['list','--limit','3','--json']])
+        return self.call(event='StoreReceipt',spec=spec,expected=[['remember','42','--title','42','--importance','important','--json'],['show',ID,'--json'] if read else ['list','--limit','3','--json']])
     def denied(self,out):
         if not out.strip():return False
         doc=json.loads(out)
