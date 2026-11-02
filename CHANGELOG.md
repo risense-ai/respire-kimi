@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.9 — 2026-11-03
+
+- Migrate the documented engine install entry from the deprecated `@rsrsai/cli` package to `rsrs-cli` in the README; the `rsrs` command name is unchanged.
+- Test-only: tolerate Windows handle-release lag when cleaning temporary guard directories, so timeout-tree tests no longer flake unrelated checks.
+
 ## 0.1.8 — 2026-11-02
 
 - Normalize redirections before command identification; require verified placement for inherited-importance merges and important updates.
