@@ -87,7 +87,9 @@ else:
 
 class CredentialGuard(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix='kimi-guard-')
+        # Timeout tests kill hanging spies just before cleanup; on Windows the
+        # killed tree can still hold a handle on the case directory for a moment.
+        self.temp = tempfile.TemporaryDirectory(prefix='kimi-guard-', ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
         self.case = Path(self.temp.name)
         self.spy = self.case / 'spy.py'
@@ -719,7 +721,7 @@ class VersionConsistency(unittest.TestCase):
 class CleanupReceipt(unittest.TestCase):
     """Extract only the reviewed cleanup function; never execute the full suite."""
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix='kimi-cleanup-')
+        self.temp = tempfile.TemporaryDirectory(prefix='kimi-cleanup-', ignore_cleanup_errors=True)
         self.addCleanup(self.temp.cleanup)
         self.case = Path(self.temp.name)
         source = (ROOT/'tests/test_hooks.sh').read_text(encoding='utf-8')
