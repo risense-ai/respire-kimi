@@ -2,7 +2,7 @@
 
 > 吸即存，呼即取——给 Kimi Code 装上本地加密记忆。
 
-`respire` 是 Kimi Code 插件（清单 `kimi.plugin.json`，插件 id `respire`）：以 hooks 把 [respire（CLI 名 rsrs）](https://www.npmjs.com/package/@rsrsai/cli) 记忆引擎挂进 agent 循环——每轮标题档自动召回、「记：」前缀交模型判重并选择父节点后存储。本地优先、端侧加密、云端 LWW 同步；**不带自定义安装脚本，按 Kimi Code 标准 `/plugins` 链路安装**。
+`respire` 是 Kimi Code 插件（清单 `kimi.plugin.json`，插件 id `respire`）：以 hooks 把 [respire（CLI 名 rsrs）](https://www.npmjs.com/package/rsrs-cli) 记忆引擎挂进 agent 循环——每轮标题档自动召回、「记：」前缀交模型判重并选择父节点后存储。本地优先、端侧加密、云端 LWW 同步；**不带自定义安装脚本，按 Kimi Code 标准 `/plugins` 链路安装**。
 
 ## 不装模型完全可用（降级是一等公民）
 
@@ -21,7 +21,7 @@
 
 升级：`/plugins` 面板对 respire 执行更新（或重新 install 覆盖），随后 `/reload`。
 
-引擎（rsrs CLI）缺失时插件会把安装命令交给 agent 代跑（`npm i -g @rsrsai/cli@latest`），可让 agent 代装，装完同会话内即恢复。
+引擎（rsrs CLI）缺失时插件会把安装命令交给 agent 代跑（`npm i -g rsrs-cli@latest`），可让 agent 代装，装完同会话内即恢复。
 
 ## 启用与关闭
 
